@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes promo-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint
-# version: 1.0.1
+# about: Ensures digest includes promo-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking)
+# version: 1.0.2
 # authors: you
 
 after_initialize do
@@ -36,20 +36,59 @@ after_initialize do
     DEFAULT_DIGEST_LIMIT = 40
 
     # External summary endpoint (set empty to disable posting)
-    ENDPOINT_URL = "https://ai.templetrends.com/discourse_digest_promo_run_ingest.php"
+    ENDPOINT_URL = "https://ai.templetrends.com/digest_inject.php"
 
     # Optional secret header (leave empty to disable)
     SECRET_HEADER_VALUE = "" # sent as X-Promo-Postback-Secret
 
-    # Log the HTTP status code for the summary POST
+    # Log the HTTP status code for the summary POST (in Sidekiq job logs)
     LOG_POST_RESULTS = false
 
-    # HTTP timeouts (seconds)
+    # HTTP timeouts (seconds) - used in Sidekiq job
     HTTP_OPEN_TIMEOUT = 3
     HTTP_READ_TIMEOUT = 5
+
+    # IMPORTANT: Sidekiq job args should not be huge. This keeps payload smaller.
+    # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
+    SEND_IDS_ONLY = false
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
+
+  # ============================================================
+  # ASYNC JOB (NON-BLOCKING HTTP POST)
+  # ============================================================
+  module ::Jobs
+    class PromoDigestSendSummary < ::Jobs::Base
+      def execute(args)
+        endpoint = args["endpoint_url"].to_s.strip
+        return if endpoint.empty?
+
+        payload_json = args["payload_json"].to_s
+        return if payload_json.empty?
+
+        secret = args["secret"].to_s
+        log_results = args["log_post_results"] == true
+
+        uri = URI.parse(endpoint)
+
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = (uri.scheme == "https")
+        http.open_timeout = (args["open_timeout"] || 3).to_i
+        http.read_timeout = (args["read_timeout"] || 5).to_i
+
+        req = Net::HTTP::Post.new(uri.request_uri)
+        req["Content-Type"] = "application/json"
+        req["X-Promo-Postback-Secret"] = secret if secret.strip != ""
+        req.body = payload_json
+
+        res = http.request(req)
+        Rails.logger.info("[#{PLUGIN_NAME}] async summary POST => #{res.code}") if log_results
+      rescue => e
+        Rails.logger.warn("[#{PLUGIN_NAME}] async summary POST failed: #{e.class}: #{e.message}")
+      end
+    end
+  end
 
   module ::PromoDigestInjector
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
@@ -119,8 +158,8 @@ after_initialize do
         end
       end
 
-      # Always best-effort summary post
-      send_summary_post(
+      # Always best-effort ASYNC summary post (never blocks digest)
+      enqueue_summary_post(
         user: user,
         marker_field: marker_field,
         marker_value: marker_value,
@@ -197,7 +236,7 @@ after_initialize do
         .order(Arel.sql(case_sql))
     end
 
-    # IMPORTANT: do NOT use Topic.slug_path (not available on some versions)
+    # Robust URL builder (no Topic.slug_path dependency)
     def self.serialize_topics(ids)
       return [] if ids.blank?
 
@@ -219,11 +258,17 @@ after_initialize do
       rows.sort_by { |t| idx[t[:id]] || 999_999 }
     end
 
-    def self.send_summary_post(user:, marker_field:, marker_value:, original_ids:, marked_ids_in_original:, injected_ids:, final_ids:, is_skipped_haspromo:, is_skipped_coinflip:, replaced_indices:)
+    # Smaller payload option (IDs only)
+    def self.pack_topics(ids)
+      return [] if ids.blank?
+      return ids if ::PromoDigestConfig::SEND_IDS_ONLY
+      serialize_topics(ids)
+    end
+
+    def self.enqueue_summary_post(user:, marker_field:, marker_value:, original_ids:, marked_ids_in_original:, injected_ids:, final_ids:, is_skipped_haspromo:, is_skipped_coinflip:, replaced_indices:)
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
 
-      uri = URI.parse(endpoint)
       now_iso = Time.now.utc.iso8601
 
       payload = {
@@ -238,13 +283,13 @@ after_initialize do
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
 
-        original_topics: serialize_topics(original_ids),
-        marked_topics_in_original: serialize_topics(marked_ids_in_original),
+        original_topics: pack_topics(original_ids),
+        marked_topics_in_original: pack_topics(marked_ids_in_original),
 
-        # NEW: full objects for ONLY the injected promo topics
-        injected_topics: serialize_topics(injected_ids),
+        # NEW: ONLY the injected promo topics
+        injected_topics: pack_topics(injected_ids),
 
-        final_topics: serialize_topics(final_ids),
+        final_topics: pack_topics(final_ids),
 
         debug: {
           injected_topic_ids: injected_ids,
@@ -252,22 +297,17 @@ after_initialize do
         }
       }
 
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = (uri.scheme == "https")
-      http.open_timeout = ::PromoDigestConfig::HTTP_OPEN_TIMEOUT
-      http.read_timeout = ::PromoDigestConfig::HTTP_READ_TIMEOUT
-
-      req = Net::HTTP::Post.new(uri.request_uri)
-      req["Content-Type"] = "application/json"
-      if (s = ::PromoDigestConfig::SECRET_HEADER_VALUE.to_s).strip != ""
-        req["X-Promo-Postback-Secret"] = s
-      end
-      req.body = payload.to_json
-
-      res = http.request(req)
-      Rails.logger.info("[#{PLUGIN_NAME}] summary POST => #{res.code}") if ::PromoDigestConfig::LOG_POST_RESULTS
+      Jobs.enqueue(
+        :promo_digest_send_summary,
+        endpoint_url: ::PromoDigestConfig::ENDPOINT_URL,
+        secret: ::PromoDigestConfig::SECRET_HEADER_VALUE,
+        log_post_results: ::PromoDigestConfig::LOG_POST_RESULTS,
+        open_timeout: ::PromoDigestConfig::HTTP_OPEN_TIMEOUT,
+        read_timeout: ::PromoDigestConfig::HTTP_READ_TIMEOUT,
+        payload_json: payload.to_json
+      )
     rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] summary POST failed: #{e.class}: #{e.message}")
+      Rails.logger.warn("[#{PLUGIN_NAME}] enqueue summary POST failed: #{e.class}: #{e.message}")
     end
   end
 
