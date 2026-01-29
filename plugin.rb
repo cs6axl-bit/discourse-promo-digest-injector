@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes promo-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint
-# version: 1.0.0
+# version: 1.0.1
 # authors: you
 
 after_initialize do
@@ -36,7 +36,7 @@ after_initialize do
     DEFAULT_DIGEST_LIMIT = 40
 
     # External summary endpoint (set empty to disable posting)
-    ENDPOINT_URL = "https://ai.templetrends.com/digest_inject.php"
+    ENDPOINT_URL = "https://ai.templetrends.com/discourse_digest_promo_run_ingest.php"
 
     # Optional secret header (leave empty to disable)
     SECRET_HEADER_VALUE = "" # sent as X-Promo-Postback-Secret
@@ -126,10 +126,10 @@ after_initialize do
         marker_value: marker_value,
         original_ids: original_ids,
         marked_ids_in_original: original_ids.select { |tid| marked_ids_set.include?(tid) },
+        injected_ids: injected_ids,
         final_ids: final_ids,
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
-        injected_ids: injected_ids,
         replaced_indices: replace_indices
       )
 
@@ -197,16 +197,20 @@ after_initialize do
         .order(Arel.sql(case_sql))
     end
 
+    # IMPORTANT: do NOT use Topic.slug_path (not available on some versions)
     def self.serialize_topics(ids)
       return [] if ids.blank?
 
       rows = Topic.where(id: ids).pluck(:id, :title, :slug, :category_id).map do |id, title, slug, category_id|
+        slug_s = slug.to_s.strip
+        path = slug_s.empty? ? "/t/#{id}" : "/t/#{slug_s}/#{id}"
+
         {
           id: id,
           title: title,
           slug: slug,
           category_id: category_id,
-          url: "#{Discourse.base_url}#{Topic.slug_path(slug, id)}"
+          url: "#{Discourse.base_url}#{path}"
         }
       end
 
@@ -215,7 +219,7 @@ after_initialize do
       rows.sort_by { |t| idx[t[:id]] || 999_999 }
     end
 
-    def self.send_summary_post(user:, marker_field:, marker_value:, original_ids:, marked_ids_in_original:, final_ids:, is_skipped_haspromo:, is_skipped_coinflip:, injected_ids:, replaced_indices:)
+    def self.send_summary_post(user:, marker_field:, marker_value:, original_ids:, marked_ids_in_original:, injected_ids:, final_ids:, is_skipped_haspromo:, is_skipped_coinflip:, replaced_indices:)
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
 
@@ -236,6 +240,10 @@ after_initialize do
 
         original_topics: serialize_topics(original_ids),
         marked_topics_in_original: serialize_topics(marked_ids_in_original),
+
+        # NEW: full objects for ONLY the injected promo topics
+        injected_topics: serialize_topics(injected_ids),
+
         final_topics: serialize_topics(final_ids),
 
         debug: {
