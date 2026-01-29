@@ -18,7 +18,7 @@ after_initialize do
     ENABLED = true
 
     # PROMO SOURCE: Tag name on topics (case-insensitive)
-    PROMO_TAG = "helpfull"
+    PROMO_TAG = "helpful"
 
     # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
     MIN_POSITION = 3
