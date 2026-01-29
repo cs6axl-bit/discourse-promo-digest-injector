@@ -19,7 +19,7 @@ after_initialize do
 
     # Marker in topic_custom_fields: name/value
     PROMO_TOPIC_MARKER_FIELD = "has_promo_comment"
-    PROMO_TOPIC_MARKER_VALUE = "1"
+    PROMO_TOPIC_MARKER_VALUE = "indeed"
 
     # If ANY promo-marked topic exists in positions 1..MIN_POSITION => do nothing
     MIN_POSITION = 3
