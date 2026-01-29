@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking)
-# version: 1.0.3
+# version: 1.0.4
 # authors: you
 
 after_initialize do
@@ -17,8 +17,8 @@ after_initialize do
   module ::PromoDigestConfig
     ENABLED = true
 
-    # PROMO SOURCE: Tag name on topics
-    PROMO_TAG = "helpfull" # tag name (case-insensitive; Discourse stores tags lowercased)
+    # PROMO SOURCE: Tag name on topics (case-insensitive)
+    PROMO_TAG = "helpfull"
 
     # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
     MIN_POSITION = 3
@@ -102,7 +102,10 @@ after_initialize do
       original_ids = original_relation.limit(limit).pluck(:id)
       return original_relation if original_ids.blank?
 
-      tagged_ids_set = fetch_tagged_topic_ids(original_ids, promo_tag).to_set
+      tag = find_tag_by_name_ci(promo_tag)
+      tag_id = tag&.id
+
+      tagged_ids_set = fetch_tagged_topic_ids(original_ids, tag_id).to_set
 
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
@@ -120,6 +123,9 @@ after_initialize do
       final_ids = original_ids.dup
       injected_ids = []
       replace_indices = []
+      attempted_replace = false
+      candidate_pool_count = 0
+      visible_pool_count = 0
 
       if !is_skipped_haspromo
         # coinflip skip
@@ -134,11 +140,12 @@ after_initialize do
 
           window = [replace_within_top_n, final_ids.length].min
           if window > 0 && replace_count > 0
+            attempted_replace = true
             replace_indices = (0...window).to_a.sample([replace_count, window].min)
 
-            injected_ids = pick_random_promo_topic_ids(
+            injected_ids, candidate_pool_count, visible_pool_count = pick_random_promo_topic_ids(
               user,
-              promo_tag: promo_tag,
+              tag_id: tag_id,
               exclude_ids: final_ids,
               limit: replace_indices.length
             )
@@ -160,13 +167,19 @@ after_initialize do
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag,
+        promo_tag_found: !tag_id.nil?,
+        promo_tag_id: tag_id,
+        promo_tag_total_topics: (tag_id ? count_all_topics_with_tag(tag_id) : 0),
         original_ids: original_ids,
         tagged_ids_in_original: original_ids.select { |tid| tagged_ids_set.include?(tid) },
         injected_ids: injected_ids,
         final_ids: final_ids,
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
-        replaced_indices: replace_indices
+        replaced_indices: replace_indices,
+        attempted_replace: attempted_replace,
+        candidate_pool_count: candidate_pool_count,
+        visible_pool_count: visible_pool_count
       )
 
       build_ordered_relation(user, final_ids)
@@ -182,44 +195,70 @@ after_initialize do
       l
     end
 
+    # ---------- TAG HELPERS (robust: resolve tag_id once) ----------
+    def self.find_tag_by_name_ci(name)
+      n = name.to_s.strip.downcase
+      return nil if n.empty?
+      Tag.where("LOWER(name) = ?", n).first
+    end
+
+    def self.count_all_topics_with_tag(tag_id)
+      return 0 if tag_id.nil?
+      TopicTag.where(tag_id: tag_id).count
+    end
+
     # Fetch which of the given topic_ids have the promo tag
-    def self.fetch_tagged_topic_ids(topic_ids, promo_tag)
+    def self.fetch_tagged_topic_ids(topic_ids, tag_id)
       return [] if topic_ids.blank?
-      return [] if promo_tag.to_s.strip.empty?
+      return [] if tag_id.nil?
 
       TopicTag
-        .joins(:tag)
-        .where(topic_id: topic_ids, tags: { name: promo_tag })
+        .where(topic_id: topic_ids, tag_id: tag_id)
         .pluck(:topic_id)
     end
 
-    def self.pick_random_promo_topic_ids(user, promo_tag:, exclude_ids:, limit:)
-      return [] if limit.to_i <= 0
-      return [] if promo_tag.to_s.strip.empty?
+    # Returns [injected_ids, candidate_pool_count, visible_pool_count]
+    def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:)
+      return [[], 0, 0] if limit.to_i <= 0
+      return [[], 0, 0] if tag_id.nil?
 
       guardian = Guardian.new(user)
 
-      # Pull random candidates from topic_tags first (cheap-ish)
+      # Pull random candidates from topic_tags first
       candidate_ids =
         TopicTag
-          .joins(:tag)
-          .where(tags: { name: promo_tag })
+          .where(tag_id: tag_id)
           .where.not(topic_id: exclude_ids)
           .order(Arel.sql("RANDOM()"))
           .limit(300)
           .pluck(:topic_id)
 
-      return [] if candidate_ids.blank?
+      candidate_pool_count = candidate_ids.length
+      return [[], candidate_pool_count, 0] if candidate_ids.blank?
 
-      # Filter to topics user can see; then randomize and take needed count
-      Topic
-        .visible
-        .secured(guardian)
-        .where(id: candidate_ids)
-        .where.not(id: exclude_ids)
-        .order(Arel.sql("RANDOM()"))
-        .limit(limit)
-        .pluck(:id)
+      # Filter to visible for this user
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .where.not(id: exclude_ids)
+          .pluck(:id)
+
+      visible_pool_count = visible_ids.length
+      return [[], candidate_pool_count, visible_pool_count] if visible_ids.blank?
+
+      injected_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: visible_ids)
+          .where.not(id: exclude_ids)
+          .order(Arel.sql("RANDOM()"))
+          .limit(limit)
+          .pluck(:id)
+
+      [injected_ids, candidate_pool_count, visible_pool_count]
     end
 
     def self.build_ordered_relation(user, ids)
@@ -267,7 +306,23 @@ after_initialize do
       serialize_topics(ids)
     end
 
-    def self.enqueue_summary_post(user:, promo_tag:, original_ids:, tagged_ids_in_original:, injected_ids:, final_ids:, is_skipped_haspromo:, is_skipped_coinflip:, replaced_indices:)
+    def self.enqueue_summary_post(
+      user:,
+      promo_tag:,
+      promo_tag_found:,
+      promo_tag_id:,
+      promo_tag_total_topics:,
+      original_ids:,
+      tagged_ids_in_original:,
+      injected_ids:,
+      final_ids:,
+      is_skipped_haspromo:,
+      is_skipped_coinflip:,
+      replaced_indices:,
+      attempted_replace:,
+      candidate_pool_count:,
+      visible_pool_count:
+    )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
 
@@ -287,12 +342,18 @@ after_initialize do
         original_topics: pack_topics(original_ids),
         tagged_topics_in_original: pack_topics(tagged_ids_in_original),
 
-        # ONLY the injected promo topics
         injected_topics: pack_topics(injected_ids),
-
         final_topics: pack_topics(final_ids),
 
         debug: {
+          promo_tag_found: promo_tag_found,
+          promo_tag_id: promo_tag_id,
+          promo_tag_total_topics: promo_tag_total_topics,
+
+          attempted_replace: attempted_replace,
+          candidate_pool_count: candidate_pool_count,
+          visible_pool_count: visible_pool_count,
+
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices
         }
