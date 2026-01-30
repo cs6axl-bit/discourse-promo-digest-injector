@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking)
-# version: 1.0.4
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching".
+# version: 1.0.6
 # authors: you
 
 after_initialize do
@@ -20,6 +20,11 @@ after_initialize do
     # PROMO SOURCE: Tag name on topics (case-insensitive)
     PROMO_TAG = "helpful"
 
+    # NEW: If user is "watching" any categories, only pick promo-tagged topics from those categories.
+    # If user is watching none => fallback to all categories.
+    USE_WATCHED_CATEGORIES = true
+    INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
+
     # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
     MIN_POSITION = 3
 
@@ -27,7 +32,7 @@ after_initialize do
     COINFLIP_SKIP_PERCENT = 30 # 0..100
 
     # Otherwise: replace REPLACE_COUNT topics within the top REPLACE_WITHIN_TOP_N digest positions
-    # using REPLACE_COUNT randomly chosen promo-tagged topics from the whole forum
+    # using REPLACE_COUNT randomly chosen promo-tagged topics from the whole forum (or watched categories)
     REPLACE_WITHIN_TOP_N = 4
     REPLACE_COUNT        = 2
 
@@ -127,6 +132,9 @@ after_initialize do
       candidate_pool_count = 0
       visible_pool_count = 0
 
+      watched_category_ids = []
+      watched_filter_applied = false
+
       if !is_skipped_haspromo
         # coinflip skip
         if rand(100) < skip_percent
@@ -143,12 +151,13 @@ after_initialize do
             attempted_replace = true
             replace_indices = (0...window).to_a.sample([replace_count, window].min)
 
-            injected_ids, candidate_pool_count, visible_pool_count = pick_random_promo_topic_ids(
-              user,
-              tag_id: tag_id,
-              exclude_ids: final_ids,
-              limit: replace_indices.length
-            )
+            injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied =
+              pick_random_promo_topic_ids(
+                user,
+                tag_id: tag_id,
+                exclude_ids: final_ids,
+                limit: replace_indices.length
+              )
 
             # Only inject if we got enough promo topics
             if injected_ids.length == replace_indices.length
@@ -179,7 +188,9 @@ after_initialize do
         replaced_indices: replace_indices,
         attempted_replace: attempted_replace,
         candidate_pool_count: candidate_pool_count,
-        visible_pool_count: visible_pool_count
+        visible_pool_count: visible_pool_count,
+        watched_category_ids: watched_category_ids,
+        watched_filter_applied: watched_filter_applied
       )
 
       build_ordered_relation(user, final_ids)
@@ -217,48 +228,83 @@ after_initialize do
         .pluck(:topic_id)
     end
 
-    # Returns [injected_ids, candidate_pool_count, visible_pool_count]
+    # ---------- WATCHED CATEGORY HELPERS ----------
+    def self.watched_category_ids_for_user(user)
+      return [] unless ::PromoDigestConfig::USE_WATCHED_CATEGORIES
+      return [] if user.nil?
+
+      # CategoryUser.notification_levels usually exists; fall back to numeric defaults if not.
+      levels = []
+      if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
+        nl = CategoryUser.notification_levels
+        levels << (nl[:watching] || 3)
+        if ::PromoDigestConfig::INCLUDE_WATCHING_FIRST_POST
+          levels << (nl[:watching_first_post] || 4)
+        end
+      else
+        levels = ::PromoDigestConfig::INCLUDE_WATCHING_FIRST_POST ? [3, 4] : [3]
+      end
+
+      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:)
-      return [[], 0, 0] if limit.to_i <= 0
-      return [[], 0, 0] if tag_id.nil?
+      return [[], 0, 0, [], false] if limit.to_i <= 0
+      return [[], 0, 0, [], false] if tag_id.nil?
 
       guardian = Guardian.new(user)
 
-      # Pull random candidates from topic_tags first
-      candidate_ids =
+      watched_ids = watched_category_ids_for_user(user)
+      watched_filter_applied = watched_ids.present?
+
+      # Pull random candidates from topic_tags first.
+      # If watched categories exist, restrict to those categories via join to topics.
+      topic_tag_scope =
         TopicTag
-          .where(tag_id: tag_id)
-          .where.not(topic_id: exclude_ids)
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_id })
+          .where.not(topic_tags: { topic_id: exclude_ids })
+
+      topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      candidate_ids =
+        topic_tag_scope
           .order(Arel.sql("RANDOM()"))
           .limit(300)
-          .pluck(:topic_id)
+          .pluck("topic_tags.topic_id")
 
       candidate_pool_count = candidate_ids.length
-      return [[], candidate_pool_count, 0] if candidate_ids.blank?
+      return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
 
-      # Filter to visible for this user
-      visible_ids =
+      # Filter to visible for this user (keep security/visibility rules)
+      visible_scope =
         Topic
           .visible
           .secured(guardian)
           .where(id: candidate_ids)
           .where.not(id: exclude_ids)
-          .pluck(:id)
+
+      visible_scope = visible_scope.where(category_id: watched_ids) if watched_filter_applied
+
+      visible_ids = visible_scope.pluck(:id)
 
       visible_pool_count = visible_ids.length
-      return [[], candidate_pool_count, visible_pool_count] if visible_ids.blank?
+      return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
 
       injected_ids =
-        Topic
-          .visible
-          .secured(guardian)
-          .where(id: visible_ids)
-          .where.not(id: exclude_ids)
+        visible_scope
           .order(Arel.sql("RANDOM()"))
           .limit(limit)
           .pluck(:id)
 
-      [injected_ids, candidate_pool_count, visible_pool_count]
+      [injected_ids, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] pick_random_promo_topic_ids failed: #{e.class}: #{e.message}")
+      [[], 0, 0, [], false]
     end
 
     def self.build_ordered_relation(user, ids)
@@ -321,7 +367,9 @@ after_initialize do
       replaced_indices:,
       attempted_replace:,
       candidate_pool_count:,
-      visible_pool_count:
+      visible_pool_count:,
+      watched_category_ids:,
+      watched_filter_applied:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -353,6 +401,10 @@ after_initialize do
           attempted_replace: attempted_replace,
           candidate_pool_count: candidate_pool_count,
           visible_pool_count: visible_pool_count,
+
+          watched_category_ids: watched_category_ids, # <-- ADDED (your request)
+          watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
+          watched_filter_applied: watched_filter_applied,
 
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices
