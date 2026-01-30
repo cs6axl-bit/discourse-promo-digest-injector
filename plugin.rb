@@ -33,8 +33,8 @@ after_initialize do
 
     # Otherwise: replace REPLACE_COUNT topics within the top REPLACE_WITHIN_TOP_N digest positions
     # using REPLACE_COUNT randomly chosen promo-tagged topics from the whole forum (or watched categories)
-    REPLACE_WITHIN_TOP_N = 4
-    REPLACE_COUNT        = 2
+    REPLACE_WITHIN_TOP_N = 3
+    REPLACE_COUNT        = 1
 
     # Digest list limit (Discourse passes opts[:limit], but we keep a safe default)
     DEFAULT_DIGEST_LIMIT = 40
