@@ -54,7 +54,7 @@ after_initialize do
 
     # IMPORTANT: Sidekiq job args should not be huge. This keeps payload smaller.
     # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
-    SEND_IDS_ONLY = false
+    SEND_IDS_ONLY = true
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
