@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also can require a minimum number of digests before injecting.
-# version: 1.0.7
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
+# version: 1.0.8
 # authors: you
 
 after_initialize do
@@ -20,15 +20,14 @@ after_initialize do
     # NEW: Don't activate promo insertion logic until user has received at least this many digests
     MIN_DIGESTS_BEFORE_INJECT = 3
 
-    # Optional: if you run the "digest-downgrader-counter" plugin, it stores digest count here:
-    # custom field name: "digest_sent_counter"
-    # If present, we use it (fast). If missing, we fallback to EmailLog.
+    # If you run the digest counter plugin, it stores digest count here (fast path):
+    # user.custom_fields["digest_sent_counter"] => "1","2",...
     DIGEST_COUNT_CUSTOM_FIELD = "digest_sent_counter"
 
     # PROMO SOURCE: Tag name on topics (case-insensitive)
     PROMO_TAG = "helpful"
 
-    # NEW: If user is "watching" any categories, only pick promo-tagged topics from those categories.
+    # If user is "watching" any categories, only pick promo-tagged topics from those categories.
     # If user is watching none => fallback to all categories.
     USE_WATCHED_CATEGORIES = true
     INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
@@ -63,6 +62,10 @@ after_initialize do
     # IMPORTANT: Sidekiq job args should not be huge. This keeps payload smaller.
     # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
     SEND_IDS_ONLY = true
+
+    # NEW: Store last 50 digest topics per user (IDs only), newest digest first, duplicates allowed
+    LAST_DIGEST_TOPICS_FIELD = "promo_digest_last50_topic_ids" # JSON array of ints (string)
+    LAST_DIGEST_TOPICS_MAX   = 50
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -104,72 +107,94 @@ after_initialize do
 
   module ::PromoDigestInjector
     # ----------------------------
-    # MIN DIGESTS GATE
+    # Digest count helper (gate)
     # ----------------------------
     def self.user_digest_count(user)
       return 0 if user.nil?
 
-      # Fast path: use the counter maintained by your other plugin (if present)
       cf_key = ::PromoDigestConfig::DIGEST_COUNT_CUSTOM_FIELD.to_s.strip
       if cf_key != ""
         cf_val = user.custom_fields[cf_key]
         return cf_val.to_i if cf_val.present?
       end
 
-      # Fallback: check EmailLog for digest sends (limit to MIN threshold for performance)
       min_needed = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
       min_needed = 0 if min_needed < 0
       return 0 if min_needed <= 0
 
-      # Count up to min_needed (we don't need the full count)
+      # We only need to know if the user reached the threshold, so cap the query.
       EmailLog.where(user_id: user.id, email_type: "digest").limit(min_needed).count
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] user_digest_count failed: #{e.class}: #{e.message}")
       0
     end
 
+    # ----------------------------
+    # Store last 50 digest topics (newest digest first; duplicates allowed)
+    # ----------------------------
+    def self.persist_last_digest_topics(user, topic_ids)
+      return if user.nil?
+
+      field = ::PromoDigestConfig::LAST_DIGEST_TOPICS_FIELD.to_s
+      return if field.strip.empty?
+
+      max_n = ::PromoDigestConfig::LAST_DIGEST_TOPICS_MAX.to_i
+      max_n = 50 if max_n <= 0
+
+      current = Array(topic_ids).map(&:to_i).reject(&:zero?)
+      return if current.empty?
+
+      # Keep digest order exactly as used in the digest (first = first in digest)
+      current = current.first(max_n)
+
+      User.transaction do
+        u = User.lock.find(user.id)
+
+        prev_json = u.custom_fields[field].to_s
+        prev =
+          begin
+            JSON.parse(prev_json)
+          rescue
+            []
+          end
+        prev = Array(prev).map(&:to_i).reject(&:zero?)
+
+        # NO DEDUPE: newest digest first, then older history
+        combined = (current + prev).first(max_n)
+
+        u.custom_fields[field] = combined.to_json
+        u.save_custom_fields(true)
+      end
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] persist_last_digest_topics failed: #{e.class}: #{e.message}")
+    end
+
+    # ----------------------------
+    # Main hook
+    # ----------------------------
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
       return original_relation unless ::PromoDigestConfig::ENABLED
       return original_relation unless Thread.current[:promo_digest_in_digest] == true
       return original_relation if user.nil?
 
-      # NEW: Do not inject promos until user has received at least N digests
+      limit = extract_limit(opts)
+      original_ids = original_relation.limit(limit).pluck(:id)
+      return original_relation if original_ids.blank?
+
+      # Always store last 50 topics the user received in the digest
+      # - If we later inject, we'll store final_ids again (so final wins).
+      persist_last_digest_topics(user, original_ids)
+
+      # Gate: don't inject promos until user has received >= MIN_DIGESTS_BEFORE_INJECT digests
       min_digests = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
       min_digests = 0 if min_digests < 0
       if min_digests > 0
         got = user_digest_count(user)
-        if got < min_digests
-          # Best-effort summary post showing it was gated (optional but helpful)
-          enqueue_summary_post(
-            user: user,
-            promo_tag: ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase,
-            promo_tag_found: false,
-            promo_tag_id: nil,
-            promo_tag_total_topics: 0,
-            original_ids: original_relation.limit(extract_limit(opts)).pluck(:id),
-            tagged_ids_in_original: [],
-            injected_ids: [],
-            final_ids: original_relation.limit(extract_limit(opts)).pluck(:id),
-            is_skipped_haspromo: true,
-            is_skipped_coinflip: false,
-            replaced_indices: [],
-            attempted_replace: false,
-            candidate_pool_count: 0,
-            visible_pool_count: 0,
-            watched_category_ids: [],
-            watched_filter_applied: false,
-            gate_info: { min_required: min_digests, user_digest_count: got, gated: true }
-          )
-          return original_relation
-        end
+        return original_relation if got < min_digests
       end
 
       promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
       return original_relation if promo_tag.empty?
-
-      limit = extract_limit(opts)
-      original_ids = original_relation.limit(limit).pluck(:id)
-      return original_relation if original_ids.blank?
 
       tag = find_tag_by_name_ci(promo_tag)
       tag_id = tag&.id
@@ -200,7 +225,6 @@ after_initialize do
       watched_filter_applied = false
 
       if !is_skipped_haspromo
-        # coinflip skip
         if rand(100) < skip_percent
           is_skipped_coinflip = true
         else
@@ -223,7 +247,6 @@ after_initialize do
                 limit: replace_indices.length
               )
 
-            # Only inject if we got enough promo topics
             if injected_ids.length == replace_indices.length
               replace_indices.each_with_index do |idx, j|
                 final_ids[idx] = injected_ids[j]
@@ -236,7 +259,10 @@ after_initialize do
         end
       end
 
-      # Always best-effort ASYNC summary post (never blocks digest)
+      # Store final digest topics (after any injection) as "latest digest"
+      persist_last_digest_topics(user, final_ids)
+
+      # Best-effort ASYNC summary post (never blocks digest)
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag,
@@ -254,8 +280,7 @@ after_initialize do
         candidate_pool_count: candidate_pool_count,
         visible_pool_count: visible_pool_count,
         watched_category_ids: watched_category_ids,
-        watched_filter_applied: watched_filter_applied,
-        gate_info: { min_required: min_digests, user_digest_count: (min_digests > 0 ? user_digest_count(user) : nil), gated: false }
+        watched_filter_applied: watched_filter_applied
       )
 
       build_ordered_relation(user, final_ids)
@@ -271,7 +296,7 @@ after_initialize do
       l
     end
 
-    # ---------- TAG HELPERS (robust: resolve tag_id once) ----------
+    # ---------- TAG HELPERS ----------
     def self.find_tag_by_name_ci(name)
       n = name.to_s.strip.downcase
       return nil if n.empty?
@@ -283,14 +308,10 @@ after_initialize do
       TopicTag.where(tag_id: tag_id).count
     end
 
-    # Fetch which of the given topic_ids have the promo tag
     def self.fetch_tagged_topic_ids(topic_ids, tag_id)
       return [] if topic_ids.blank?
       return [] if tag_id.nil?
-
-      TopicTag
-        .where(topic_id: topic_ids, tag_id: tag_id)
-        .pluck(:topic_id)
+      TopicTag.where(topic_id: topic_ids, tag_id: tag_id).pluck(:topic_id)
     end
 
     # ---------- WATCHED CATEGORY HELPERS ----------
@@ -298,7 +319,6 @@ after_initialize do
       return [] unless ::PromoDigestConfig::USE_WATCHED_CATEGORIES
       return [] if user.nil?
 
-      # CategoryUser.notification_levels usually exists; fall back to numeric defaults if not.
       levels = []
       if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
         nl = CategoryUser.notification_levels
@@ -326,8 +346,6 @@ after_initialize do
       watched_ids = watched_category_ids_for_user(user)
       watched_filter_applied = watched_ids.present?
 
-      # Pull random candidates from topic_tags first.
-      # If watched categories exist, restrict to those categories via join to topics.
       topic_tag_scope =
         TopicTag
           .joins(:topic)
@@ -345,7 +363,6 @@ after_initialize do
       candidate_pool_count = candidate_ids.length
       return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
 
-      # Filter to visible for this user (keep security/visibility rules)
       visible_scope =
         Topic
           .visible
@@ -356,7 +373,6 @@ after_initialize do
       visible_scope = visible_scope.where(category_id: watched_ids) if watched_filter_applied
 
       visible_ids = visible_scope.pluck(:id)
-
       visible_pool_count = visible_ids.length
       return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
 
@@ -410,7 +426,6 @@ after_initialize do
       rows.sort_by { |t| idx[t[:id]] || 999_999 }
     end
 
-    # Smaller payload option (IDs only)
     def self.pack_topics(ids)
       return [] if ids.blank?
       return ids if ::PromoDigestConfig::SEND_IDS_ONLY
@@ -434,8 +449,7 @@ after_initialize do
       candidate_pool_count:,
       visible_pool_count:,
       watched_category_ids:,
-      watched_filter_applied:,
-      gate_info: nil
+      watched_filter_applied:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -473,9 +487,7 @@ after_initialize do
           watched_filter_applied: watched_filter_applied,
 
           injected_topic_ids: injected_ids,
-          replaced_indices: replaced_indices,
-
-          gate: gate_info
+          replaced_indices: replaced_indices
         }
       }
 
