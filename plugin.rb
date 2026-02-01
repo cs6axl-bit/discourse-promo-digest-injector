@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching".
-# version: 1.0.6
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also can require a minimum number of digests before injecting.
+# version: 1.0.7
 # authors: you
 
 after_initialize do
@@ -16,6 +16,14 @@ after_initialize do
   # ============================================================
   module ::PromoDigestConfig
     ENABLED = true
+
+    # NEW: Don't activate promo insertion logic until user has received at least this many digests
+    MIN_DIGESTS_BEFORE_INJECT = 3
+
+    # Optional: if you run the "digest-downgrader-counter" plugin, it stores digest count here:
+    # custom field name: "digest_sent_counter"
+    # If present, we use it (fast). If missing, we fallback to EmailLog.
+    DIGEST_COUNT_CUSTOM_FIELD = "digest_sent_counter"
 
     # PROMO SOURCE: Tag name on topics (case-insensitive)
     PROMO_TAG = "helpful"
@@ -95,10 +103,66 @@ after_initialize do
   end
 
   module ::PromoDigestInjector
+    # ----------------------------
+    # MIN DIGESTS GATE
+    # ----------------------------
+    def self.user_digest_count(user)
+      return 0 if user.nil?
+
+      # Fast path: use the counter maintained by your other plugin (if present)
+      cf_key = ::PromoDigestConfig::DIGEST_COUNT_CUSTOM_FIELD.to_s.strip
+      if cf_key != ""
+        cf_val = user.custom_fields[cf_key]
+        return cf_val.to_i if cf_val.present?
+      end
+
+      # Fallback: check EmailLog for digest sends (limit to MIN threshold for performance)
+      min_needed = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
+      min_needed = 0 if min_needed < 0
+      return 0 if min_needed <= 0
+
+      # Count up to min_needed (we don't need the full count)
+      EmailLog.where(user_id: user.id, email_type: "digest").limit(min_needed).count
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] user_digest_count failed: #{e.class}: #{e.message}")
+      0
+    end
+
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
       return original_relation unless ::PromoDigestConfig::ENABLED
       return original_relation unless Thread.current[:promo_digest_in_digest] == true
       return original_relation if user.nil?
+
+      # NEW: Do not inject promos until user has received at least N digests
+      min_digests = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
+      min_digests = 0 if min_digests < 0
+      if min_digests > 0
+        got = user_digest_count(user)
+        if got < min_digests
+          # Best-effort summary post showing it was gated (optional but helpful)
+          enqueue_summary_post(
+            user: user,
+            promo_tag: ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase,
+            promo_tag_found: false,
+            promo_tag_id: nil,
+            promo_tag_total_topics: 0,
+            original_ids: original_relation.limit(extract_limit(opts)).pluck(:id),
+            tagged_ids_in_original: [],
+            injected_ids: [],
+            final_ids: original_relation.limit(extract_limit(opts)).pluck(:id),
+            is_skipped_haspromo: true,
+            is_skipped_coinflip: false,
+            replaced_indices: [],
+            attempted_replace: false,
+            candidate_pool_count: 0,
+            visible_pool_count: 0,
+            watched_category_ids: [],
+            watched_filter_applied: false,
+            gate_info: { min_required: min_digests, user_digest_count: got, gated: true }
+          )
+          return original_relation
+        end
+      end
 
       promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
       return original_relation if promo_tag.empty?
@@ -190,7 +254,8 @@ after_initialize do
         candidate_pool_count: candidate_pool_count,
         visible_pool_count: visible_pool_count,
         watched_category_ids: watched_category_ids,
-        watched_filter_applied: watched_filter_applied
+        watched_filter_applied: watched_filter_applied,
+        gate_info: { min_required: min_digests, user_digest_count: (min_digests > 0 ? user_digest_count(user) : nil), gated: false }
       )
 
       build_ordered_relation(user, final_ids)
@@ -369,7 +434,8 @@ after_initialize do
       candidate_pool_count:,
       visible_pool_count:,
       watched_category_ids:,
-      watched_filter_applied:
+      watched_filter_applied:,
+      gate_info: nil
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -402,12 +468,14 @@ after_initialize do
           candidate_pool_count: candidate_pool_count,
           visible_pool_count: visible_pool_count,
 
-          watched_category_ids: watched_category_ids, # <-- ADDED (your request)
+          watched_category_ids: watched_category_ids,
           watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
           watched_filter_applied: watched_filter_applied,
 
           injected_topic_ids: injected_ids,
-          replaced_indices: replaced_indices
+          replaced_indices: replaced_indices,
+
+          gate: gate_info
         }
       }
 
