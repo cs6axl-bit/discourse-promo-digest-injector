@@ -46,7 +46,7 @@ after_initialize do
     DEFAULT_DIGEST_LIMIT = 40
 
     # External summary endpoint (set empty to disable posting)
-    ENDPOINT_URL = "https://ai.templetrends.com/digest_inject.php"
+    ENDPOINT_URL = "http://172.17.0.1:8081/digest_inject.php"
 
     # Optional secret header (leave empty to disable)
     SECRET_HEADER_VALUE = "" # sent as X-Promo-Postback-Secret
