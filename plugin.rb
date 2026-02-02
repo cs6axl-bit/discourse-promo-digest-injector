@@ -342,10 +342,10 @@ after_initialize do
           is_skipped_coinflip = true
         else
           replace_within_top_n = ::PromoDigestConfig::REPLACE_WITHIN_TOP_N.to_i
-          replace_within_top_n = 4 if replace_within_top_n <= 0
+          replace_within_top_n = 3 if replace_within_top_n <= 0
 
           replace_count = ::PromoDigestConfig::REPLACE_COUNT.to_i
-          replace_count = 2 if replace_count <= 0
+          replace_count = 1 if replace_count <= 0
 
           window = [replace_within_top_n, final_ids.length].min
           if window > 0 && replace_count > 0
