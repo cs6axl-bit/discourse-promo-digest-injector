@@ -108,7 +108,7 @@ after_initialize do
     #   2) Only if not enough are available, FALLBACK to forum-wide candidates OUTSIDE the digest list
     #      and replace the remaining slots (replacement, no insertion).
     # ============================================================
-    PROMO_PICK_MODE = "global" # "global" or "prefer_digest_list"
+    PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
