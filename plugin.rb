@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.4
+# version: 1.2.5
 # authors: you
 
 after_initialize do
@@ -79,7 +79,7 @@ after_initialize do
     # (If user has no previous digest, this constraint is not applied.)
     FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = false
 
-    # NEW: soft fallback when REQUIRE_CREATED... is enabled but no candidates match:
+    # soft fallback when REQUIRE_CREATED... is enabled but no candidates match:
     # - First try "created_at > last_digest" candidates.
     # - If none found, fallback to ANY watched-category topic within lookahead window.
     # In both cases, we choose the NEWEST (max created_at) candidate.
@@ -239,32 +239,47 @@ after_initialize do
 
       limit = extract_limit(opts)
       original_ids = original_relation.limit(limit).pluck(:id)
-      return original_relation if original_ids.blank?
+      original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
+
+      # Even if empty, we still want to POST a report
+      # (but there is nothing to reorder; keep relation as-is).
+      # We still compute minimal info for a report below.
 
       # Store initial digest topics (pre-injection)
-      persist_last_digest_topics(user, original_ids)
-
-      # Gate: don't inject promos until user has received >= MIN_DIGESTS_BEFORE_INJECT digests
-      min_digests = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
-      min_digests = 0 if min_digests < 0
-      if min_digests > 0
-        got = user_digest_count(user)
-        return original_relation if got < min_digests
-      end
+      persist_last_digest_topics(user, original_ids) if original_ids.present?
 
       promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
-      return original_relation if promo_tag.empty?
 
-      tag = find_tag_by_name_ci(promo_tag)
+      # ---------- GATE: do not return early; just mark skipped ----------
+      min_digests_required = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
+      min_digests_required = 0 if min_digests_required < 0
+
+      user_digest_count_val = 0
+      is_skipped_min_digests = false
+      if min_digests_required > 0
+        user_digest_count_val = user_digest_count(user)
+        is_skipped_min_digests = (user_digest_count_val < min_digests_required)
+      end
+
+      tag = promo_tag.empty? ? nil : find_tag_by_name_ci(promo_tag)
       tag_id = tag&.id
 
-      tagged_ids_set = fetch_tagged_topic_ids(original_ids, tag_id).to_set
+      tagged_ids_set =
+        if original_ids.present? && tag_id
+          fetch_tagged_topic_ids(original_ids, tag_id).to_set
+        else
+          Set.new
+        end
 
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
 
-      # Skip if any promo-tagged topic already appears in top MIN_POSITION
-      has_tagged_in_top = original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
+      has_tagged_in_top =
+        if original_ids.present?
+          original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
+        else
+          false
+        end
 
       skip_percent = ::PromoDigestConfig::COINFLIP_SKIP_PERCENT.to_i
       skip_percent = 0 if skip_percent < 0
@@ -300,7 +315,12 @@ after_initialize do
       fallback_picked = []
       used_fallback_outside_digest = false
 
-      if !is_skipped_haspromo
+      # ============================================================
+      # IMPORTANT FIX:
+      # If user has < MIN_DIGESTS_BEFORE_INJECT, we DO NOT inject,
+      # but we STILL send a report to the endpoint.
+      # ============================================================
+      if !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present?
         if rand(100) < skip_percent
           is_skipped_coinflip = true
         else
@@ -316,9 +336,6 @@ after_initialize do
             replace_indices = (0...window).to_a.sample([replace_count, window].min)
 
             if prefer_digest_list_mode
-              # ============================================
-              # NEW MODE: Prefer digest list first (Option A = SWAP)
-              # ============================================
               tmp_ids = final_ids.dup
 
               eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
@@ -382,9 +399,6 @@ after_initialize do
                 injected_ids = swapped_in_ids
               end
             else
-              # ============================================
-              # GLOBAL MODE: Forum-wide pool (legacy/current)
-              # ============================================
               injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied =
                 pick_random_promo_topic_ids(
                   user,
@@ -412,10 +426,12 @@ after_initialize do
       final_ids = ensure_first_topic_from_watched_category(user, final_ids)
       forced_first_applied = (before_force_first != final_ids)
 
-      # Store final digest topics
-      persist_last_digest_topics(user, final_ids)
+      # Persist final digest topics ONLY if different (prevents double-log of same digest list)
+      if final_ids.present? && final_ids != original_ids
+        persist_last_digest_topics(user, final_ids)
+      end
 
-      # Async summary post
+      # Async summary post (ALWAYS runs, even if skipped due to min_digests)
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag,
@@ -428,6 +444,9 @@ after_initialize do
         final_ids: final_ids,
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
+        is_skipped_min_digests: is_skipped_min_digests,
+        min_digests_required: min_digests_required,
+        user_digest_count: user_digest_count_val,
         replaced_indices: replace_indices,
         attempted_replace: attempted_replace,
         candidate_pool_count: candidate_pool_count,
@@ -445,6 +464,9 @@ after_initialize do
         fallback_picked: fallback_picked,
         used_fallback_outside_digest: used_fallback_outside_digest
       )
+
+      # If there's nothing to order, keep original relation.
+      return original_relation if final_ids.blank?
 
       build_ordered_relation(user, final_ids)
     rescue => e
@@ -501,10 +523,6 @@ after_initialize do
 
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
-    # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
-    # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
-    #     * try candidates created after last digest (pick newest created_at)
-    #     * if none and SOFT_FALLBACK => pick newest watched-category candidate regardless
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
@@ -526,7 +544,6 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
-      # Pull id/category/created_at for candidates in window (secured)
       rows =
         Topic
           .visible
@@ -536,7 +553,6 @@ after_initialize do
 
       return ids if rows.blank?
 
-      # Build candidates that are in watched categories
       watched_rows = rows.select { |_tid, cid, _created| cid && watched_ids.include?(cid) }
       return ids if watched_rows.blank?
 
@@ -548,7 +564,6 @@ after_initialize do
         last_ts = last_digest_sent_at_for_user(user)
       end
 
-      # Helper: pick newest by created_at (then id tie-break)
       pick_newest = lambda do |arr|
         arr.max_by { |tid, _cid, created| [(created ? created.to_i : 0), tid.to_i] }
       end
@@ -565,15 +580,12 @@ after_initialize do
           return ids
         end
       else
-        # No created_after requirement (or no last digest): just pick newest watched-category topic
         chosen = pick_newest.call(watched_rows)
       end
 
       return ids if chosen.nil?
       chosen_id = chosen[0].to_i
       return ids if chosen_id <= 0
-
-      # If already first, nothing to do
       return ids if ids.first.to_i == chosen_id
 
       new_ids = ids.dup
@@ -590,7 +602,6 @@ after_initialize do
     # ============================================================
     # Prefer-digest-list: eligible promo set inside digest list
     # ============================================================
-    # Returns: [eligible_set, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.eligible_promo_set_within_digest_list(user, tag_id:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
       return [Set.new, 0, 0, [], false] if tag_id.nil?
@@ -637,9 +648,8 @@ after_initialize do
     end
 
     # ============================================================
-    # Prefer-digest-list: swap eligible promos into target indices (Option A)
+    # Prefer-digest-list: swap eligible promos into target indices
     # ============================================================
-    # Returns: [satisfied_indices, swapped_in_ids_for_targets, remaining_indices]
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
       return [[], [], replace_indices] if ids.blank?
       idxs = Array(replace_indices).map(&:to_i).uniq
@@ -691,7 +701,6 @@ after_initialize do
     # ============================================================
     # Global picker (forum-wide)
     # ============================================================
-    # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_id.nil?
@@ -803,6 +812,9 @@ after_initialize do
       final_ids:,
       is_skipped_haspromo:,
       is_skipped_coinflip:,
+      is_skipped_min_digests:,
+      min_digests_required:,
+      user_digest_count:,
       replaced_indices:,
       attempted_replace:,
       candidate_pool_count:,
@@ -835,6 +847,7 @@ after_initialize do
 
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
+        is_skipped_min_digests: is_skipped_min_digests,
 
         original_topics: pack_topics(original_ids),
         tagged_topics_in_original: pack_topics(tagged_ids_in_original),
@@ -846,6 +859,9 @@ after_initialize do
           promo_tag_found: promo_tag_found,
           promo_tag_id: promo_tag_id,
           promo_tag_total_topics: promo_tag_total_topics,
+
+          min_digests_required: min_digests_required,
+          user_digest_count: user_digest_count,
 
           attempted_replace: attempted_replace,
           candidate_pool_count: candidate_pool_count,
