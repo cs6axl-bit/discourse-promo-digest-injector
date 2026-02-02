@@ -467,7 +467,7 @@ after_initialize do
       candidate_ids =
         topic_tag_scope
           .order(Arel.sql("RANDOM()"))
-          .limit(300)
+          .limit(20)
           .pluck("topic_tags.topic_id")
 
       candidate_pool_count = candidate_ids.length
