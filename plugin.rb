@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.6
+# version: 1.2.7
 # authors: you
 
 after_initialize do
@@ -73,6 +73,11 @@ after_initialize do
     # 0   => never apply
     # 100 => always apply
     FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
+
+    # NEW (default OFF): if false, we DO NOT change the first topic if it's already watched.
+    # if true, we will "upgrade" first topic to the NEWEST watched-category topic in the lookahead window
+    # (previous behavior)
+    FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED = false
 
     # If true, the forced-first watched-category candidate must have:
     #   topics.created_at > user's last digest sent time
@@ -230,7 +235,7 @@ after_initialize do
     end
 
     # ----------------------------
-    # NEW: helper to indicate whether current first topic is from watched category
+    # helper to indicate whether current first topic is from watched category
     # ----------------------------
     def self.first_topic_is_watched_category?(user, ids)
       return false if user.nil?
@@ -267,6 +272,9 @@ after_initialize do
       persist_last_digest_topics(user, original_ids) if original_ids.present?
 
       promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
+
+      # Always compute user's watched categories for reporting clarity
+      user_watched_category_ids = watched_category_ids_for_user(user)
 
       # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
       min_digests_required = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
@@ -493,7 +501,8 @@ after_initialize do
         digest_list_visible_count: digest_list_visible_count,
         digest_list_picked: digest_list_picked,
         fallback_picked: fallback_picked,
-        used_fallback_outside_digest: used_fallback_outside_digest
+        used_fallback_outside_digest: used_fallback_outside_digest,
+        user_watched_category_ids: user_watched_category_ids
       )
 
       # If nothing to order, keep original relation (report already enqueued)
@@ -555,6 +564,8 @@ after_initialize do
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
     # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
+    # - NEW: if FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED is false (default),
+    #   and first topic is already watched => DO NOTHING
     # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
     #     * try candidates created after last digest (pick newest created_at)
     #     * if none and SOFT_FALLBACK => pick newest watched-category candidate regardless
@@ -573,11 +584,27 @@ after_initialize do
       watched_ids = watched_category_ids_for_user(user)
       return ids if watched_ids.blank?
 
+      guardian = Guardian.new(user)
+
+      # If default mode (always pick newest = false): don't change if first is already watched
+      unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED == true
+        first_id = ids.first.to_i
+        if first_id > 0
+          first_cid =
+            Topic
+              .visible
+              .secured(guardian)
+              .where(id: first_id)
+              .pluck(:category_id)
+              .first
+
+          return ids if first_cid.present? && watched_ids.include?(first_cid)
+        end
+      end
+
       lookahead = ::PromoDigestConfig::FORCE_FIRST_TOPIC_LOOKAHEAD.to_i
       lookahead = ids.length if lookahead <= 0
       window_ids = ids.first([lookahead, ids.length].min)
-
-      guardian = Guardian.new(user)
 
       # Pull id/category/created_at for candidates in window (secured)
       rows =
@@ -874,7 +901,8 @@ after_initialize do
       digest_list_visible_count:,
       digest_list_picked:,
       fallback_picked:,
-      used_fallback_outside_digest:
+      used_fallback_outside_digest:,
+      user_watched_category_ids:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -917,12 +945,16 @@ after_initialize do
           candidate_pool_count: candidate_pool_count,
           visible_pool_count: visible_pool_count,
 
+          # clarity: always include the user's watched categories, even if promo injection was skipped
+          user_watched_category_ids: user_watched_category_ids,
+
           watched_category_ids: watched_category_ids,
           watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
           watched_filter_applied: watched_filter_applied,
 
           forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
           forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
+          force_first_topic_always_pick_newest_watched: ::PromoDigestConfig::FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED,
           forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
           forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
