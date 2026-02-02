@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.0.8
+# version: 1.1.0
 # authors: you
 
 after_initialize do
@@ -63,9 +63,19 @@ after_initialize do
     # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
     SEND_IDS_ONLY = true
 
-    # NEW: Store last 50 digest topics per user (IDs only), newest digest first, duplicates allowed
+    # Store last 50 digest topics per user (IDs only), newest digest first, duplicates allowed
     LAST_DIGEST_TOPICS_FIELD = "promo_digest_last50_topic_ids" # JSON array of ints (string)
     LAST_DIGEST_TOPICS_MAX   = 50
+
+    # Always ensure first digest topic is from a watched category (if user watches any)
+    FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY = true
+
+    # How far into the digest we'll look for a watched-category topic to swap into position 0
+    FORCE_FIRST_TOPIC_LOOKAHEAD = 40
+
+    # NEW: Promo pool recency gate:
+    # Only allow promo-candidate topics whose topics.created_at is AFTER the user's last sent digest.
+    FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST = true
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -127,6 +137,34 @@ after_initialize do
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] user_digest_count failed: #{e.class}: #{e.message}")
       0
+    end
+
+    # ----------------------------
+    # Last digest sent timestamp (used for promo pool filter)
+    # ----------------------------
+    def self.last_digest_sent_at_for_user(user)
+      return nil if user.nil?
+
+      # Cache per digest build (avoids any accidental double-hit)
+      cache_key = :"promo_digest_last_digest_sent_at_user_#{user.id}"
+      if Thread.current.key?(cache_key)
+        return Thread.current[cache_key]
+      end
+
+      ts =
+        EmailLog
+          .where(user_id: user.id, email_type: "digest")
+          .order(created_at: :desc)
+          .limit(1)
+          .pluck(:created_at)
+          .first
+
+      Thread.current[cache_key] = ts
+      ts
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] last_digest_sent_at_for_user failed: #{e.class}: #{e.message}")
+      Thread.current[cache_key] = nil
+      nil
     end
 
     # ----------------------------
@@ -224,6 +262,11 @@ after_initialize do
       watched_category_ids = []
       watched_filter_applied = false
 
+      # NEW: last digest timestamp (used for promo pool recency filter)
+      last_digest_sent_at = last_digest_sent_at_for_user(user)
+      created_after_last_digest_filter_enabled = (::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
+      created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && last_digest_sent_at.present?)
+
       if !is_skipped_haspromo
         if rand(100) < skip_percent
           is_skipped_coinflip = true
@@ -244,7 +287,8 @@ after_initialize do
                 user,
                 tag_id: tag_id,
                 exclude_ids: final_ids,
-                limit: replace_indices.length
+                limit: replace_indices.length,
+                created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
               )
 
             if injected_ids.length == replace_indices.length
@@ -259,7 +303,12 @@ after_initialize do
         end
       end
 
-      # Store final digest topics (after any injection) as "latest digest"
+      # ALWAYS enforce: first topic must be from watched category (if user watches any)
+      before_force_first = final_ids
+      final_ids = ensure_first_topic_from_watched_category(user, final_ids)
+      forced_first_applied = (before_force_first != final_ids)
+
+      # Store final digest topics (after any injection + first-topic enforcement) as "latest digest"
       persist_last_digest_topics(user, final_ids)
 
       # Best-effort ASYNC summary post (never blocks digest)
@@ -280,7 +329,11 @@ after_initialize do
         candidate_pool_count: candidate_pool_count,
         visible_pool_count: visible_pool_count,
         watched_category_ids: watched_category_ids,
-        watched_filter_applied: watched_filter_applied
+        watched_filter_applied: watched_filter_applied,
+        forced_first_applied: forced_first_applied,
+        last_digest_sent_at: last_digest_sent_at,
+        created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
+        created_after_last_digest_filter_applied: created_after_last_digest_filter_applied
       )
 
       build_ordered_relation(user, final_ids)
@@ -336,8 +389,60 @@ after_initialize do
       []
     end
 
+    # ----------------------------
+    # Ensure first digest topic is from a watched category (swap-based)
+    # ----------------------------
+    def self.ensure_first_topic_from_watched_category(user, ids)
+      return ids if user.nil?
+      return ids if ids.blank?
+      return ids unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY
+
+      watched_ids = watched_category_ids_for_user(user)
+      return ids if watched_ids.blank?
+
+      lookahead = ::PromoDigestConfig::FORCE_FIRST_TOPIC_LOOKAHEAD.to_i
+      lookahead = ids.length if lookahead <= 0
+      window_ids = ids.first([lookahead, ids.length].min)
+
+      guardian = Guardian.new(user)
+
+      # Pull category_id for the ids we may consider (visibility/permissions safe)
+      rows =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: window_ids)
+          .pluck(:id, :category_id)
+
+      return ids if rows.blank?
+
+      cat_by_id = {}
+      rows.each { |tid, cid| cat_by_id[tid] = cid }
+
+      first_id = ids.first
+      first_cat = cat_by_id[first_id]
+      return ids if first_cat && watched_ids.include?(first_cat)
+
+      candidate_id = window_ids.find do |tid|
+        cid = cat_by_id[tid]
+        cid && watched_ids.include?(cid)
+      end
+      return ids if candidate_id.nil?
+
+      # Swap candidate into position 0, preserve overall order otherwise
+      new_ids = ids.dup
+      cand_idx = new_ids.index(candidate_id)
+      return ids if cand_idx.nil? || cand_idx == 0
+
+      new_ids[0], new_ids[cand_idx] = new_ids[cand_idx], new_ids[0]
+      new_ids
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] ensure_first_topic_from_watched_category failed: #{e.class}: #{e.message}")
+      ids
+    end
+
     # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
-    def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:)
+    def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_id.nil?
 
@@ -353,6 +458,11 @@ after_initialize do
           .where.not(topic_tags: { topic_id: exclude_ids })
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      # NEW: created_at must be AFTER the user's last digest sent time (if provided)
+      if ::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+        topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
+      end
 
       candidate_ids =
         topic_tag_scope
@@ -449,7 +559,11 @@ after_initialize do
       candidate_pool_count:,
       visible_pool_count:,
       watched_category_ids:,
-      watched_filter_applied:
+      watched_filter_applied:,
+      forced_first_applied:,
+      last_digest_sent_at:,
+      created_after_last_digest_filter_enabled:,
+      created_after_last_digest_filter_applied:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -485,6 +599,13 @@ after_initialize do
           watched_category_ids: watched_category_ids,
           watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
           watched_filter_applied: watched_filter_applied,
+
+          forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
+          forced_first_topic_applied: forced_first_applied,
+
+          created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
+          created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
+          last_digest_sent_at_utc: (last_digest_sent_at.present? ? last_digest_sent_at.utc.iso8601 : nil),
 
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices
