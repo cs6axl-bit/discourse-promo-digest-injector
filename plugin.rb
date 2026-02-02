@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.2
+# version: 1.2.4
 # authors: you
 
 after_initialize do
@@ -69,12 +69,23 @@ after_initialize do
     # Always ensure first digest topic is from a watched category (if user watches any)
     FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY = true
 
-    # NEW: % chance to APPLY the "force first topic from watched category" logic.
+    # % chance to APPLY the "force first topic from watched category" logic.
     # 0   => never apply
     # 100 => always apply
     FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
 
-    # How far into the digest we'll look for a watched-category topic to swap into position 0
+    # If true, the forced-first watched-category candidate must have:
+    #   topics.created_at > user's last digest sent time
+    # (If user has no previous digest, this constraint is not applied.)
+    FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = false
+
+    # NEW: soft fallback when REQUIRE_CREATED... is enabled but no candidates match:
+    # - First try "created_at > last_digest" candidates.
+    # - If none found, fallback to ANY watched-category topic within lookahead window.
+    # In both cases, we choose the NEWEST (max created_at) candidate.
+    FORCE_FIRST_TOPIC_SOFT_FALLBACK = true
+
+    # How far into the digest we'll look for a watched-category topic to consider for position 0
     FORCE_FIRST_TOPIC_LOOKAHEAD = 40
 
     # Promo pool recency gate:
@@ -92,7 +103,7 @@ after_initialize do
     #   2) Only if not enough are available, FALLBACK to forum-wide candidates OUTSIDE the digest list
     #      and replace the remaining slots (replacement, no insertion).
     # ============================================================
-    PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
+    PROMO_PICK_MODE = "global" # "global" or "prefer_digest_list"
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -156,7 +167,7 @@ after_initialize do
     end
 
     # ----------------------------
-    # Last digest sent timestamp (used for promo pool filter)
+    # Last digest sent timestamp (used for promo pool filter + optional forced-first constraint)
     # ----------------------------
     def self.last_digest_sent_at_for_user(user)
       return nil if user.nil?
@@ -309,7 +320,6 @@ after_initialize do
               # NEW MODE: Prefer digest list first (Option A = SWAP)
               # ============================================
               tmp_ids = final_ids.dup
-              need = replace_indices.length
 
               eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
                 eligible_promo_set_within_digest_list(
@@ -490,7 +500,11 @@ after_initialize do
     end
 
     # ----------------------------
-    # Ensure first digest topic is from a watched category (swap-based) WITH COINFLIP PERCENT
+    # Ensure first digest topic is from a watched category (swap-based)
+    # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
+    # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
+    #     * try candidates created after last digest (pick newest created_at)
+    #     * if none and SOFT_FALLBACK => pick newest watched-category candidate regardless
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
@@ -512,33 +526,61 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
+      # Pull id/category/created_at for candidates in window (secured)
       rows =
         Topic
           .visible
           .secured(guardian)
           .where(id: window_ids)
-          .pluck(:id, :category_id)
+          .pluck(:id, :category_id, :created_at)
 
       return ids if rows.blank?
 
-      cat_by_id = {}
-      rows.each { |tid, cid| cat_by_id[tid] = cid }
+      # Build candidates that are in watched categories
+      watched_rows = rows.select { |_tid, cid, _created| cid && watched_ids.include?(cid) }
+      return ids if watched_rows.blank?
 
-      first_id = ids.first
-      first_cat = cat_by_id[first_id]
-      return ids if first_cat && watched_ids.include?(first_cat)
+      require_created_after = (::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST == true)
+      soft_fallback = (::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK == true)
 
-      candidate_id = window_ids.find do |tid|
-        cid = cat_by_id[tid]
-        cid && watched_ids.include?(cid)
+      last_ts = nil
+      if require_created_after
+        last_ts = last_digest_sent_at_for_user(user)
       end
-      return ids if candidate_id.nil?
+
+      # Helper: pick newest by created_at (then id tie-break)
+      pick_newest = lambda do |arr|
+        arr.max_by { |tid, _cid, created| [(created ? created.to_i : 0), tid.to_i] }
+      end
+
+      chosen = nil
+
+      if require_created_after && last_ts.present?
+        newer = watched_rows.select { |_tid, _cid, created| created.present? && created > last_ts }
+        if newer.present?
+          chosen = pick_newest.call(newer)
+        elsif soft_fallback
+          chosen = pick_newest.call(watched_rows)
+        else
+          return ids
+        end
+      else
+        # No created_after requirement (or no last digest): just pick newest watched-category topic
+        chosen = pick_newest.call(watched_rows)
+      end
+
+      return ids if chosen.nil?
+      chosen_id = chosen[0].to_i
+      return ids if chosen_id <= 0
+
+      # If already first, nothing to do
+      return ids if ids.first.to_i == chosen_id
 
       new_ids = ids.dup
-      cand_idx = new_ids.index(candidate_id)
-      return ids if cand_idx.nil? || cand_idx == 0
+      chosen_idx = new_ids.index(chosen_id)
+      return ids if chosen_idx.nil? || chosen_idx == 0
 
-      new_ids[0], new_ids[cand_idx] = new_ids[cand_idx], new_ids[0]
+      new_ids[0], new_ids[chosen_idx] = new_ids[chosen_idx], new_ids[0]
       new_ids
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] ensure_first_topic_from_watched_category failed: #{e.class}: #{e.message}")
@@ -622,10 +664,7 @@ after_initialize do
 
         candidates = eligible_set.to_a.reject { |tid| used_source_ids.include?(tid) }
         candidates.select! { |tid| pos.key?(tid) && pos[tid] != target_idx }
-
-        if candidates.empty?
-          next
-        end
+        next if candidates.empty?
 
         target_set = idxs.to_set
         outside = candidates.select { |tid| !target_set.include?(pos[tid]) }
@@ -677,7 +716,7 @@ after_initialize do
       candidate_ids =
         topic_tag_scope
           .order(Arel.sql("RANDOM()"))
-          .limit(10)
+          .limit(300)
           .pluck("topic_tags.topic_id")
 
       candidate_pool_count = candidate_ids.length
@@ -818,6 +857,8 @@ after_initialize do
 
           forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
           forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
+          forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
+          forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
 
           created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
