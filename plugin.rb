@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.5
+# version: 1.2.6
 # authors: you
 
 after_initialize do
@@ -230,6 +230,28 @@ after_initialize do
     end
 
     # ----------------------------
+    # NEW: helper to indicate whether current first topic is from watched category
+    # ----------------------------
+    def self.first_topic_is_watched_category?(user, ids)
+      return false if user.nil?
+      return false if ids.blank?
+
+      watched_ids = watched_category_ids_for_user(user)
+      return false if watched_ids.blank?
+
+      first_id = ids.first.to_i
+      return false if first_id <= 0
+
+      cid = Topic.where(id: first_id).pluck(:category_id).first
+      return false if cid.nil?
+
+      watched_ids.include?(cid)
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] first_topic_is_watched_category? failed: #{e.class}: #{e.message}")
+      false
+    end
+
+    # ----------------------------
     # Main hook
     # ----------------------------
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
@@ -241,16 +263,12 @@ after_initialize do
       original_ids = original_relation.limit(limit).pluck(:id)
       original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
 
-      # Even if empty, we still want to POST a report
-      # (but there is nothing to reorder; keep relation as-is).
-      # We still compute minimal info for a report below.
-
-      # Store initial digest topics (pre-injection)
+      # Store initial digest topics (pre-injection) - if any
       persist_last_digest_topics(user, original_ids) if original_ids.present?
 
       promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
 
-      # ---------- GATE: do not return early; just mark skipped ----------
+      # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
       min_digests_required = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
       min_digests_required = 0 if min_digests_required < 0
 
@@ -274,6 +292,7 @@ after_initialize do
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
 
+      # Skip if any promo-tagged topic already appears in top MIN_POSITION
       has_tagged_in_top =
         if original_ids.present?
           original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
@@ -316,9 +335,7 @@ after_initialize do
       used_fallback_outside_digest = false
 
       # ============================================================
-      # IMPORTANT FIX:
-      # If user has < MIN_DIGESTS_BEFORE_INJECT, we DO NOT inject,
-      # but we STILL send a report to the endpoint.
+      # Promo injection block (blocked by min-digests gate)
       # ============================================================
       if !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present?
         if rand(100) < skip_percent
@@ -421,17 +438,27 @@ after_initialize do
         end
       end
 
-      # Force first topic from watched categories (swap-based; independent of promo injection)
+      # ============================================================
+      # Force first topic from watched categories (always evaluated)
+      # ============================================================
+      first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
+      first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
+
       before_force_first = final_ids
       final_ids = ensure_first_topic_from_watched_category(user, final_ids)
       forced_first_applied = (before_force_first != final_ids)
+
+      first_topic_id_after_force = (final_ids.present? ? final_ids.first.to_i : nil)
+      first_topic_was_watched_after_force = first_topic_is_watched_category?(user, final_ids)
 
       # Persist final digest topics ONLY if different (prevents double-log of same digest list)
       if final_ids.present? && final_ids != original_ids
         persist_last_digest_topics(user, final_ids)
       end
 
-      # Async summary post (ALWAYS runs, even if skipped due to min_digests)
+      # ============================================================
+      # Async summary post (ALWAYS tries to enqueue)
+      # ============================================================
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag,
@@ -454,6 +481,10 @@ after_initialize do
         watched_category_ids: watched_category_ids,
         watched_filter_applied: watched_filter_applied,
         forced_first_applied: forced_first_applied,
+        first_topic_id_before_force: first_topic_id_before_force,
+        first_topic_id_after_force: first_topic_id_after_force,
+        first_topic_was_watched_before_force: first_topic_was_watched_before_force,
+        first_topic_was_watched_after_force: first_topic_was_watched_after_force,
         last_digest_sent_at: last_digest_sent_at,
         created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
         created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
@@ -465,7 +496,7 @@ after_initialize do
         used_fallback_outside_digest: used_fallback_outside_digest
       )
 
-      # If there's nothing to order, keep original relation.
+      # If nothing to order, keep original relation (report already enqueued)
       return original_relation if final_ids.blank?
 
       build_ordered_relation(user, final_ids)
@@ -523,6 +554,10 @@ after_initialize do
 
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
+    # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
+    # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
+    #     * try candidates created after last digest (pick newest created_at)
+    #     * if none and SOFT_FALLBACK => pick newest watched-category candidate regardless
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
@@ -544,6 +579,7 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
+      # Pull id/category/created_at for candidates in window (secured)
       rows =
         Topic
           .visible
@@ -586,6 +622,7 @@ after_initialize do
       return ids if chosen.nil?
       chosen_id = chosen[0].to_i
       return ids if chosen_id <= 0
+
       return ids if ids.first.to_i == chosen_id
 
       new_ids = ids.dup
@@ -602,6 +639,7 @@ after_initialize do
     # ============================================================
     # Prefer-digest-list: eligible promo set inside digest list
     # ============================================================
+    # Returns: [eligible_set, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.eligible_promo_set_within_digest_list(user, tag_id:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
       return [Set.new, 0, 0, [], false] if tag_id.nil?
@@ -650,6 +688,7 @@ after_initialize do
     # ============================================================
     # Prefer-digest-list: swap eligible promos into target indices
     # ============================================================
+    # Returns: [satisfied_indices, swapped_in_ids_for_targets, remaining_indices]
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
       return [[], [], replace_indices] if ids.blank?
       idxs = Array(replace_indices).map(&:to_i).uniq
@@ -701,6 +740,7 @@ after_initialize do
     # ============================================================
     # Global picker (forum-wide)
     # ============================================================
+    # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_id.nil?
@@ -822,6 +862,10 @@ after_initialize do
       watched_category_ids:,
       watched_filter_applied:,
       forced_first_applied:,
+      first_topic_id_before_force:,
+      first_topic_id_after_force:,
+      first_topic_was_watched_before_force:,
+      first_topic_was_watched_after_force:,
       last_digest_sent_at:,
       created_after_last_digest_filter_enabled:,
       created_after_last_digest_filter_applied:,
@@ -848,6 +892,15 @@ after_initialize do
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
         is_skipped_min_digests: is_skipped_min_digests,
+        min_digests_required: min_digests_required,
+        user_digest_count: user_digest_count,
+
+        # NEW top-level fields for DB columns:
+        forced_first_applied: forced_first_applied,
+        first_topic_id_before_force: first_topic_id_before_force,
+        first_topic_id_after_force: first_topic_id_after_force,
+        first_topic_was_watched_before_force: first_topic_was_watched_before_force,
+        first_topic_was_watched_after_force: first_topic_was_watched_after_force,
 
         original_topics: pack_topics(original_ids),
         tagged_topics_in_original: pack_topics(tagged_ids_in_original),
@@ -859,9 +912,6 @@ after_initialize do
           promo_tag_found: promo_tag_found,
           promo_tag_id: promo_tag_id,
           promo_tag_total_topics: promo_tag_total_topics,
-
-          min_digests_required: min_digests_required,
-          user_digest_count: user_digest_count,
 
           attempted_replace: attempted_replace,
           candidate_pool_count: candidate_pool_count,
@@ -876,6 +926,11 @@ after_initialize do
           forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
           forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
+
+          first_topic_id_before_force: first_topic_id_before_force,
+          first_topic_id_after_force: first_topic_id_after_force,
+          first_topic_was_watched_before_force: first_topic_was_watched_before_force,
+          first_topic_was_watched_after_force: first_topic_was_watched_after_force,
 
           created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
           created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
