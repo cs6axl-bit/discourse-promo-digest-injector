@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.1.0
+# version: 1.2.2
 # authors: you
 
 after_initialize do
@@ -17,7 +17,7 @@ after_initialize do
   module ::PromoDigestConfig
     ENABLED = true
 
-    # NEW: Don't activate promo insertion logic until user has received at least this many digests
+    # Don't activate promo insertion logic until user has received at least this many digests
     MIN_DIGESTS_BEFORE_INJECT = 3
 
     # If you run the digest counter plugin, it stores digest count here (fast path):
@@ -39,7 +39,6 @@ after_initialize do
     COINFLIP_SKIP_PERCENT = 30 # 0..100
 
     # Otherwise: replace REPLACE_COUNT topics within the top REPLACE_WITHIN_TOP_N digest positions
-    # using REPLACE_COUNT randomly chosen promo-tagged topics from the whole forum (or watched categories)
     REPLACE_WITHIN_TOP_N = 3
     REPLACE_COUNT        = 1
 
@@ -70,12 +69,30 @@ after_initialize do
     # Always ensure first digest topic is from a watched category (if user watches any)
     FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY = true
 
+    # NEW: % chance to APPLY the "force first topic from watched category" logic.
+    # 0   => never apply
+    # 100 => always apply
+    FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
+
     # How far into the digest we'll look for a watched-category topic to swap into position 0
     FORCE_FIRST_TOPIC_LOOKAHEAD = 40
 
-    # NEW: Promo pool recency gate:
+    # Promo pool recency gate:
     # Only allow promo-candidate topics whose topics.created_at is AFTER the user's last sent digest.
     FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST = true
+
+    # ============================================================
+    # PROMO PICK STRATEGY SWITCH
+    #
+    # "global" (current): pick promo candidates from the whole forum (tagged topics), excluding digest ids.
+    #
+    # "prefer_digest_list":
+    #   1) FIRST try to satisfy replacement slots by SWAPPING IN eligible promo-tagged topics
+    #      that are ALREADY IN the digest list (no duplicates possible).
+    #   2) Only if not enough are available, FALLBACK to forum-wide candidates OUTSIDE the digest list
+    #      and replace the remaining slots (replacement, no insertion).
+    # ============================================================
+    PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -132,7 +149,6 @@ after_initialize do
       min_needed = 0 if min_needed < 0
       return 0 if min_needed <= 0
 
-      # We only need to know if the user reached the threshold, so cap the query.
       EmailLog.where(user_id: user.id, email_type: "digest").limit(min_needed).count
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] user_digest_count failed: #{e.class}: #{e.message}")
@@ -145,11 +161,8 @@ after_initialize do
     def self.last_digest_sent_at_for_user(user)
       return nil if user.nil?
 
-      # Cache per digest build (avoids any accidental double-hit)
       cache_key = :"promo_digest_last_digest_sent_at_user_#{user.id}"
-      if Thread.current.key?(cache_key)
-        return Thread.current[cache_key]
-      end
+      return Thread.current[cache_key] if Thread.current.key?(cache_key)
 
       ts =
         EmailLog
@@ -182,7 +195,6 @@ after_initialize do
       current = Array(topic_ids).map(&:to_i).reject(&:zero?)
       return if current.empty?
 
-      # Keep digest order exactly as used in the digest (first = first in digest)
       current = current.first(max_n)
 
       User.transaction do
@@ -197,7 +209,6 @@ after_initialize do
           end
         prev = Array(prev).map(&:to_i).reject(&:zero?)
 
-        # NO DEDUPE: newest digest first, then older history
         combined = (current + prev).first(max_n)
 
         u.custom_fields[field] = combined.to_json
@@ -219,8 +230,7 @@ after_initialize do
       original_ids = original_relation.limit(limit).pluck(:id)
       return original_relation if original_ids.blank?
 
-      # Always store last 50 topics the user received in the digest
-      # - If we later inject, we'll store final_ids again (so final wins).
+      # Store initial digest topics (pre-injection)
       persist_last_digest_topics(user, original_ids)
 
       # Gate: don't inject promos until user has received >= MIN_DIGESTS_BEFORE_INJECT digests
@@ -242,7 +252,7 @@ after_initialize do
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
 
-      # If any promo-tagged topic already appears in top MIN_POSITION => do nothing
+      # Skip if any promo-tagged topic already appears in top MIN_POSITION
       has_tagged_in_top = original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
 
       skip_percent = ::PromoDigestConfig::COINFLIP_SKIP_PERCENT.to_i
@@ -256,16 +266,28 @@ after_initialize do
       injected_ids = []
       replace_indices = []
       attempted_replace = false
+
       candidate_pool_count = 0
       visible_pool_count = 0
 
       watched_category_ids = []
       watched_filter_applied = false
 
-      # NEW: last digest timestamp (used for promo pool recency filter)
+      # Recency filter anchor
       last_digest_sent_at = last_digest_sent_at_for_user(user)
       created_after_last_digest_filter_enabled = (::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
       created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && last_digest_sent_at.present?)
+
+      promo_pick_mode = ::PromoDigestConfig::PROMO_PICK_MODE.to_s.strip
+      promo_pick_mode = "global" if promo_pick_mode.empty?
+      prefer_digest_list_mode = (promo_pick_mode == "prefer_digest_list")
+
+      # Debug fields for prefer_digest_list mode
+      digest_list_candidates_count = 0
+      digest_list_visible_count = 0
+      digest_list_picked = []
+      fallback_picked = []
+      used_fallback_outside_digest = false
 
       if !is_skipped_haspromo
         if rand(100) < skip_percent
@@ -282,36 +304,108 @@ after_initialize do
             attempted_replace = true
             replace_indices = (0...window).to_a.sample([replace_count, window].min)
 
-            injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied =
-              pick_random_promo_topic_ids(
-                user,
-                tag_id: tag_id,
-                exclude_ids: final_ids,
-                limit: replace_indices.length,
-                created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
-              )
+            if prefer_digest_list_mode
+              # ============================================
+              # NEW MODE: Prefer digest list first (Option A = SWAP)
+              # ============================================
+              tmp_ids = final_ids.dup
+              need = replace_indices.length
 
-            if injected_ids.length == replace_indices.length
-              replace_indices.each_with_index do |idx, j|
-                final_ids[idx] = injected_ids[j]
+              eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
+                eligible_promo_set_within_digest_list(
+                  user,
+                  tag_id: tag_id,
+                  digest_ids: original_ids,
+                  created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                )
+
+              digest_list_candidates_count = cand_ct
+              digest_list_visible_count = vis_ct
+              watched_category_ids = watched_ids
+              watched_filter_applied = watched_applied
+
+              _satisfied, swapped_in_ids, remaining_indices =
+                swap_eligible_promos_into_indices(
+                  tmp_ids,
+                  replace_indices,
+                  eligible_set
+                )
+
+              digest_list_picked = swapped_in_ids.dup
+
+              if remaining_indices.any?
+                remaining_need = remaining_indices.length
+
+                fallback_ids, cand_b, vis_b, watched_b, watched_applied_b =
+                  pick_random_promo_topic_ids(
+                    user,
+                    tag_id: tag_id,
+                    exclude_ids: original_ids, # ensure "outside digest list"
+                    limit: remaining_need,
+                    created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                  )
+
+                used_fallback_outside_digest = fallback_ids.present?
+                fallback_picked = fallback_ids.dup
+
+                candidate_pool_count = cand_ct + cand_b
+                visible_pool_count = vis_ct + vis_b
+
+                watched_category_ids = watched_b
+                watched_filter_applied = watched_applied_b
+
+                if fallback_ids.length == remaining_need
+                  remaining_indices.each_with_index do |idx, j|
+                    tmp_ids[idx] = fallback_ids[j]
+                  end
+
+                  final_ids = tmp_ids
+                  injected_ids = swapped_in_ids + fallback_ids
+                else
+                  injected_ids = []
+                  replace_indices = []
+                end
+              else
+                candidate_pool_count = cand_ct
+                visible_pool_count = vis_ct
+                final_ids = tmp_ids
+                injected_ids = swapped_in_ids
               end
             else
-              injected_ids = []
-              replace_indices = []
+              # ============================================
+              # GLOBAL MODE: Forum-wide pool (legacy/current)
+              # ============================================
+              injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied =
+                pick_random_promo_topic_ids(
+                  user,
+                  tag_id: tag_id,
+                  exclude_ids: final_ids,
+                  limit: replace_indices.length,
+                  created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                )
+
+              if injected_ids.length == replace_indices.length
+                replace_indices.each_with_index do |idx, j|
+                  final_ids[idx] = injected_ids[j]
+                end
+              else
+                injected_ids = []
+                replace_indices = []
+              end
             end
           end
         end
       end
 
-      # ALWAYS enforce: first topic must be from watched category (if user watches any)
+      # Force first topic from watched categories (swap-based; independent of promo injection)
       before_force_first = final_ids
       final_ids = ensure_first_topic_from_watched_category(user, final_ids)
       forced_first_applied = (before_force_first != final_ids)
 
-      # Store final digest topics (after any injection + first-topic enforcement) as "latest digest"
+      # Store final digest topics
       persist_last_digest_topics(user, final_ids)
 
-      # Best-effort ASYNC summary post (never blocks digest)
+      # Async summary post
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag,
@@ -333,7 +427,13 @@ after_initialize do
         forced_first_applied: forced_first_applied,
         last_digest_sent_at: last_digest_sent_at,
         created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
-        created_after_last_digest_filter_applied: created_after_last_digest_filter_applied
+        created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
+        promo_pick_mode: promo_pick_mode,
+        digest_list_candidates_count: digest_list_candidates_count,
+        digest_list_visible_count: digest_list_visible_count,
+        digest_list_picked: digest_list_picked,
+        fallback_picked: fallback_picked,
+        used_fallback_outside_digest: used_fallback_outside_digest
       )
 
       build_ordered_relation(user, final_ids)
@@ -390,12 +490,18 @@ after_initialize do
     end
 
     # ----------------------------
-    # Ensure first digest topic is from a watched category (swap-based)
+    # Ensure first digest topic is from a watched category (swap-based) WITH COINFLIP PERCENT
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
       return ids if ids.blank?
       return ids unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY
+
+      pct = ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT.to_i
+      pct = 0 if pct < 0
+      pct = 100 if pct > 100
+      return ids if pct == 0
+      return ids if pct < 100 && rand(100) >= pct
 
       watched_ids = watched_category_ids_for_user(user)
       return ids if watched_ids.blank?
@@ -406,7 +512,6 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
-      # Pull category_id for the ids we may consider (visibility/permissions safe)
       rows =
         Topic
           .visible
@@ -429,7 +534,6 @@ after_initialize do
       end
       return ids if candidate_id.nil?
 
-      # Swap candidate into position 0, preserve overall order otherwise
       new_ids = ids.dup
       cand_idx = new_ids.index(candidate_id)
       return ids if cand_idx.nil? || cand_idx == 0
@@ -441,6 +545,113 @@ after_initialize do
       ids
     end
 
+    # ============================================================
+    # Prefer-digest-list: eligible promo set inside digest list
+    # ============================================================
+    # Returns: [eligible_set, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
+    def self.eligible_promo_set_within_digest_list(user, tag_id:, digest_ids:, created_after: nil)
+      return [Set.new, 0, 0, [], false] if user.nil?
+      return [Set.new, 0, 0, [], false] if tag_id.nil?
+      return [Set.new, 0, 0, [], false] if digest_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      watched_ids = watched_category_ids_for_user(user)
+      watched_filter_applied = watched_ids.present?
+
+      scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_id, topic_id: digest_ids })
+
+      scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      if ::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+        scope = scope.where("topics.created_at > ?", created_after)
+      end
+
+      candidate_ids =
+        scope
+          .order(Arel.sql("RANDOM()"))
+          .pluck("topic_tags.topic_id")
+
+      candidate_pool_count = candidate_ids.length
+      return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
+
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .pluck(:id)
+
+      visible_pool_count = visible_ids.length
+      return [Set.new, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
+
+      [visible_ids.to_set, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] eligible_promo_set_within_digest_list failed: #{e.class}: #{e.message}")
+      [Set.new, 0, 0, [], false]
+    end
+
+    # ============================================================
+    # Prefer-digest-list: swap eligible promos into target indices (Option A)
+    # ============================================================
+    # Returns: [satisfied_indices, swapped_in_ids_for_targets, remaining_indices]
+    def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
+      return [[], [], replace_indices] if ids.blank?
+      idxs = Array(replace_indices).map(&:to_i).uniq
+      return [[], [], []] if idxs.blank?
+      return [[], [], idxs] if eligible_set.nil? || eligible_set.empty?
+
+      satisfied = []
+      swapped_in = []
+      used_source_ids = Set.new
+
+      idxs.each do |target_idx|
+        next if target_idx < 0 || target_idx >= ids.length
+
+        if eligible_set.include?(ids[target_idx])
+          satisfied << target_idx
+          swapped_in << ids[target_idx]
+          next
+        end
+
+        pos = {}
+        ids.each_with_index { |tid, i| pos[tid] = i }
+
+        candidates = eligible_set.to_a.reject { |tid| used_source_ids.include?(tid) }
+        candidates.select! { |tid| pos.key?(tid) && pos[tid] != target_idx }
+
+        if candidates.empty?
+          next
+        end
+
+        target_set = idxs.to_set
+        outside = candidates.select { |tid| !target_set.include?(pos[tid]) }
+        pick_from = outside.any? ? outside : candidates
+
+        chosen_id = pick_from.sample
+        chosen_idx = pos[chosen_id]
+        next if chosen_idx.nil? || chosen_idx == target_idx
+
+        ids[target_idx], ids[chosen_idx] = ids[chosen_idx], ids[target_idx]
+
+        used_source_ids.add(chosen_id)
+        satisfied << target_idx
+        swapped_in << chosen_id
+      end
+
+      remaining = idxs.reject { |i| satisfied.include?(i) }
+      [satisfied, swapped_in, remaining]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] swap_eligible_promos_into_indices failed: #{e.class}: #{e.message}")
+      [[], [], Array(replace_indices)]
+    end
+
+    # ============================================================
+    # Global picker (forum-wide)
+    # ============================================================
     # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
@@ -459,7 +670,6 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      # NEW: created_at must be AFTER the user's last digest sent time (if provided)
       if ::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
@@ -467,7 +677,7 @@ after_initialize do
       candidate_ids =
         topic_tag_scope
           .order(Arel.sql("RANDOM()"))
-          .limit(20)
+          .limit(10)
           .pluck("topic_tags.topic_id")
 
       candidate_pool_count = candidate_ids.length
@@ -563,7 +773,13 @@ after_initialize do
       forced_first_applied:,
       last_digest_sent_at:,
       created_after_last_digest_filter_enabled:,
-      created_after_last_digest_filter_applied:
+      created_after_last_digest_filter_applied:,
+      promo_pick_mode:,
+      digest_list_candidates_count:,
+      digest_list_visible_count:,
+      digest_list_picked:,
+      fallback_picked:,
+      used_fallback_outside_digest:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -601,11 +817,19 @@ after_initialize do
           watched_filter_applied: watched_filter_applied,
 
           forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
+          forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
           forced_first_topic_applied: forced_first_applied,
 
           created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
           created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
           last_digest_sent_at_utc: (last_digest_sent_at.present? ? last_digest_sent_at.utc.iso8601 : nil),
+
+          promo_pick_mode: promo_pick_mode,
+          digest_list_candidates_count: digest_list_candidates_count,
+          digest_list_visible_count: digest_list_visible_count,
+          digest_list_picked: digest_list_picked,
+          used_fallback_outside_digest: used_fallback_outside_digest,
+          fallback_picked: fallback_picked,
 
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices
