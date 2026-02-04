@@ -286,6 +286,7 @@ after_initialize do
         Array(::PromoDigestConfig::PROMO_TAGS)
           .map { |t| t.to_s.strip.downcase }
           .reject(&:empty?)
+          .uniq
 
       promo_tag_for_payload = promo_tags.join(", ")
 
@@ -312,6 +313,17 @@ after_initialize do
         else
           Set.new
         end
+
+      tagged_ids_in_original =
+        if original_ids.present? && tagged_ids_set.present?
+          original_ids.select { |tid| tagged_ids_set.include?(tid) }
+        else
+          []
+        end
+
+      # Which promo tag name(s) matched each tagged topic already present in the digest list?
+      original_topics_matched_tags =
+        matched_promo_tag_names_by_topic(tagged_ids_in_original, promo_tags)
 
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
@@ -475,6 +487,18 @@ after_initialize do
       first_topic_id_after_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_after_force = first_topic_is_watched_category?(user, final_ids)
 
+      # Which promo tag name(s) matched each injected topic (if any)?
+      injected_topics_matched_tags =
+        matched_promo_tag_names_by_topic(injected_ids, promo_tags)
+
+      # (Optional convenience) Which tag was found for the FIRST injected topic (single string)
+      first_injected_tag_name =
+        if injected_ids.present?
+          Array(injected_topics_matched_tags[injected_ids.first.to_i]).first
+        else
+          nil
+        end
+
       # Persist final digest topics ONLY if different (prevents double-log of same digest list)
       if final_ids.present? && final_ids != original_ids
         persist_last_digest_topics(user, final_ids)
@@ -490,11 +514,18 @@ after_initialize do
         promo_tag_id: (tag_ids.present? ? tag_ids.first : nil),
         promo_tag_total_topics: (tag_ids.present? ? count_all_topics_with_any_tag(tag_ids) : 0),
         promo_tag_ids: tag_ids,
+        promo_tag_names: promo_tags,
+        first_injected_tag_name: first_injected_tag_name,
 
         original_ids: original_ids,
-        tagged_ids_in_original: original_ids.select { |tid| tagged_ids_set.include?(tid) },
+        tagged_ids_in_original: tagged_ids_in_original,
         injected_ids: injected_ids,
         final_ids: final_ids,
+
+        # NEW: which tag(s) matched
+        original_topics_matched_tags: original_topics_matched_tags,
+        injected_topics_matched_tags: injected_topics_matched_tags,
+
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
         is_skipped_min_digests: is_skipped_min_digests,
@@ -566,6 +597,38 @@ after_initialize do
       return [] if topic_ids.blank?
       return [] if tag_ids.blank?
       TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
+    end
+
+    # Returns { topic_id => ["helpful", "useful"] } but ONLY for promo_tag_names (case-insensitive)
+    def self.matched_promo_tag_names_by_topic(topic_ids, promo_tag_names)
+      ids = Array(topic_ids).map(&:to_i).reject(&:zero?).uniq
+      names = Array(promo_tag_names).map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+      return {} if ids.blank? || names.blank?
+
+      tags = Tag.where("LOWER(name) IN (?)", names).pluck(:id, :name)
+      return {} if tags.blank?
+
+      tag_id_to_name = {}
+      tag_ids = []
+      tags.each do |tid, tname|
+        tag_ids << tid
+        tag_id_to_name[tid.to_i] = tname.to_s
+      end
+
+      rows = TopicTag.where(topic_id: ids, tag_id: tag_ids).pluck(:topic_id, :tag_id)
+      out = Hash.new { |h, k| h[k] = [] }
+
+      rows.each do |topic_id, tag_id|
+        name = tag_id_to_name[tag_id.to_i]
+        next if name.blank?
+        out[topic_id.to_i] << name
+      end
+
+      out.each { |k, arr| out[k] = arr.uniq }
+      out
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] matched_promo_tag_names_by_topic failed: #{e.class}: #{e.message}")
+      {}
     end
 
     # ---------- WATCHED CATEGORY HELPERS ----------
@@ -922,11 +985,18 @@ after_initialize do
       promo_tag_id:,
       promo_tag_total_topics:,
       promo_tag_ids:,
+      promo_tag_names:,
+      first_injected_tag_name:,
 
       original_ids:,
       tagged_ids_in_original:,
       injected_ids:,
       final_ids:,
+
+      # NEW: which tag(s) matched which topic(s)
+      original_topics_matched_tags:,
+      injected_topics_matched_tags:,
+
       is_skipped_haspromo:,
       is_skipped_coinflip:,
       is_skipped_min_digests:,
@@ -967,6 +1037,9 @@ after_initialize do
 
         promo_tag: promo_tag,
 
+        # single-string convenience: which tag was found on the FIRST injected topic (if any)
+        first_injected_tag_name: first_injected_tag_name,
+
         is_skipped_haspromo: is_skipped_haspromo,
         is_skipped_coinflip: is_skipped_coinflip,
         is_skipped_min_digests: is_skipped_min_digests,
@@ -989,10 +1062,15 @@ after_initialize do
         debug: {
           promo_tag_found: promo_tag_found,
 
-          # Keep backward compatible scalar (first tag id), but ALSO send full array for clarity:
+          # Backward compatible scalar (first tag id), but ALSO send full array + names:
           promo_tag_id: promo_tag_id,
           promo_tag_ids: promo_tag_ids,
+          promo_tag_names: promo_tag_names,
           promo_tag_total_topics: promo_tag_total_topics,
+
+          # NEW: which tag(s) matched which topic(s)
+          original_topics_matched_tags: original_topics_matched_tags,
+          injected_topics_matched_tags: injected_topics_matched_tags,
 
           attempted_replace: attempted_replace,
           candidate_pool_count: candidate_pool_count,
