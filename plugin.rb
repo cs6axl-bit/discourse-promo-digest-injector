@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.7
+# version: 1.2.9
 # authors: you
 
 after_initialize do
@@ -43,7 +43,7 @@ after_initialize do
     REPLACE_COUNT        = 1
 
     # Digest list limit (Discourse passes opts[:limit], but we keep a safe default)
-    DEFAULT_DIGEST_LIMIT = 40
+    DEFAULT_DIGEST_LIMIT = 50
 
     # External summary endpoint (set empty to disable posting)
     ENDPOINT_URL = "http://172.17.0.1:8081/digest_inject.php"
@@ -74,24 +74,33 @@ after_initialize do
     # 100 => always apply
     FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
 
-    # NEW (default OFF): if false, we DO NOT change the first topic if it's already watched.
-    # if true, we will "upgrade" first topic to the NEWEST watched-category topic in the lookahead window
-    # (previous behavior)
-    FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED = false
+    # NEW:
+    # If true:
+    #   even when the current first topic is already in a watched category,
+    #   we STILL attempt to "refresh" position 0 by choosing randomly among
+    #   the newest N watched-category topics in the lookahead window.
+    #
+    # If false (default):
+    #   if the first topic is already watched, do nothing.
+    FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED = true
+
+    # Choose randomly among the newest N watched-category candidates in the lookahead window.
+    # (If fewer than N exist, it randomizes among what's available.)
+    FORCE_FIRST_TOPIC_RANDOM_TOP_N = 5
 
     # If true, the forced-first watched-category candidate must have:
     #   topics.created_at > user's last digest sent time
     # (If user has no previous digest, this constraint is not applied.)
-    FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = false
+    FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = true
 
     # soft fallback when REQUIRE_CREATED... is enabled but no candidates match:
     # - First try "created_at > last_digest" candidates.
     # - If none found, fallback to ANY watched-category topic within lookahead window.
-    # In both cases, we choose the NEWEST (max created_at) candidate.
+    # In both cases, we choose randomly among the newest N candidates.
     FORCE_FIRST_TOPIC_SOFT_FALLBACK = true
 
     # How far into the digest we'll look for a watched-category topic to consider for position 0
-    FORCE_FIRST_TOPIC_LOOKAHEAD = 40
+    FORCE_FIRST_TOPIC_LOOKAHEAD = 50
 
     # Promo pool recency gate:
     # Only allow promo-candidate topics whose topics.created_at is AFTER the user's last sent digest.
@@ -564,11 +573,12 @@ after_initialize do
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
     # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
-    # - NEW: if FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED is false (default),
-    #   and first topic is already watched => DO NOTHING
+    # - NEW: if FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED is true,
+    #        we do not early-return when the first topic is already watched
+    # - Selection: random among newest N watched-category topics in lookahead window
     # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
-    #     * try candidates created after last digest (pick newest created_at)
-    #     * if none and SOFT_FALLBACK => pick newest watched-category candidate regardless
+    #     * try candidates created after last digest (random among newest N)
+    #     * if none and SOFT_FALLBACK => random among newest N watched-category candidates regardless
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
@@ -586,8 +596,12 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
-      # If default mode (always pick newest = false): don't change if first is already watched
-      unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED == true
+      randomize_even_if_already_watched =
+        (::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED == true)
+
+      # If "randomize even if already watched" is OFF:
+      # and first topic is already watched => DO NOTHING
+      if !randomize_even_if_already_watched
         first_id = ids.first.to_i
         if first_id > 0
           first_cid =
@@ -627,8 +641,20 @@ after_initialize do
         last_ts = last_digest_sent_at_for_user(user)
       end
 
-      pick_newest = lambda do |arr|
-        arr.max_by { |tid, _cid, created| [(created ? created.to_i : 0), tid.to_i] }
+      top_n = ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOM_TOP_N.to_i
+      top_n = 5 if top_n <= 0
+
+      # Sort newest first (created_at desc, then id desc)
+      sort_newest_first = lambda do |arr|
+        arr.sort_by do |tid, _cid, created|
+          [-(created ? created.to_i : 0), -tid.to_i]
+        end
+      end
+
+      pick_random_from_top = lambda do |arr|
+        sorted = sort_newest_first.call(arr)
+        top = sorted.first([top_n, sorted.length].min)
+        top.sample
       end
 
       chosen = nil
@@ -636,14 +662,14 @@ after_initialize do
       if require_created_after && last_ts.present?
         newer = watched_rows.select { |_tid, _cid, created| created.present? && created > last_ts }
         if newer.present?
-          chosen = pick_newest.call(newer)
+          chosen = pick_random_from_top.call(newer)
         elsif soft_fallback
-          chosen = pick_newest.call(watched_rows)
+          chosen = pick_random_from_top.call(watched_rows)
         else
           return ids
         end
       else
-        chosen = pick_newest.call(watched_rows)
+        chosen = pick_random_from_top.call(watched_rows)
       end
 
       return ids if chosen.nil?
@@ -954,7 +980,8 @@ after_initialize do
 
           forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
           forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
-          force_first_topic_always_pick_newest_watched: ::PromoDigestConfig::FORCE_FIRST_TOPIC_ALWAYS_PICK_NEWEST_WATCHED,
+          force_first_topic_randomize_even_if_already_watched: ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED,
+          force_first_topic_random_top_n: ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOM_TOP_N,
           forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
           forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
