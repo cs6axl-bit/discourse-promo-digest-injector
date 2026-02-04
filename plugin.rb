@@ -24,8 +24,9 @@ after_initialize do
     # user.custom_fields["digest_sent_counter"] => "1","2",...
     DIGEST_COUNT_CUSTOM_FIELD = "digest_sent_counter"
 
-    # PROMO SOURCE: Tag name on topics (case-insensitive)
-    PROMO_TAG = "helpful"
+    # PROMO SOURCE: Tag names on topics (case-insensitive)
+    # A topic is considered "promo" if it has ANY of these tags (OR).
+    PROMO_TAGS = ["helpful", "useful"]
 
     # If user is "watching" any categories, only pick promo-tagged topics from those categories.
     # If user is watching none => fallback to all categories.
@@ -280,7 +281,16 @@ after_initialize do
       # Store initial digest topics (pre-injection) - if any
       persist_last_digest_topics(user, original_ids) if original_ids.present?
 
-      promo_tag = ::PromoDigestConfig::PROMO_TAG.to_s.strip.downcase
+      # Promo tags (OR: any tag qualifies)
+      promo_tags =
+        Array(::PromoDigestConfig::PROMO_TAGS)
+          .map { |t| t.to_s.strip.downcase }
+          .reject(&:empty?)
+
+      promo_tag_for_payload = promo_tags.join(", ")
+
+      tags = promo_tags.map { |t| find_tag_by_name_ci(t) }.compact
+      tag_ids = tags.map(&:id).compact.uniq
 
       # Always compute user's watched categories for reporting clarity
       user_watched_category_ids = watched_category_ids_for_user(user)
@@ -296,12 +306,9 @@ after_initialize do
         is_skipped_min_digests = (user_digest_count_val < min_digests_required)
       end
 
-      tag = promo_tag.empty? ? nil : find_tag_by_name_ci(promo_tag)
-      tag_id = tag&.id
-
       tagged_ids_set =
-        if original_ids.present? && tag_id
-          fetch_tagged_topic_ids(original_ids, tag_id).to_set
+        if original_ids.present? && tag_ids.present?
+          fetch_tagged_topic_ids_any_tag(original_ids, tag_ids).to_set
         else
           Set.new
         end
@@ -354,7 +361,7 @@ after_initialize do
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
       # ============================================================
-      if !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present?
+      if !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present? && tag_ids.present?
         if rand(100) < skip_percent
           is_skipped_coinflip = true
         else
@@ -375,7 +382,7 @@ after_initialize do
               eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
                 eligible_promo_set_within_digest_list(
                   user,
-                  tag_id: tag_id,
+                  tag_ids: tag_ids,
                   digest_ids: original_ids,
                   created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
                 )
@@ -400,7 +407,7 @@ after_initialize do
                 fallback_ids, cand_b, vis_b, watched_b, watched_applied_b =
                   pick_random_promo_topic_ids(
                     user,
-                    tag_id: tag_id,
+                    tag_ids: tag_ids,
                     exclude_ids: original_ids, # ensure "outside digest list"
                     limit: remaining_need,
                     created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
@@ -436,7 +443,7 @@ after_initialize do
               injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied =
                 pick_random_promo_topic_ids(
                   user,
-                  tag_id: tag_id,
+                  tag_ids: tag_ids,
                   exclude_ids: final_ids,
                   limit: replace_indices.length,
                   created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
@@ -478,10 +485,12 @@ after_initialize do
       # ============================================================
       enqueue_summary_post(
         user: user,
-        promo_tag: promo_tag,
-        promo_tag_found: !tag_id.nil?,
-        promo_tag_id: tag_id,
-        promo_tag_total_topics: (tag_id ? count_all_topics_with_tag(tag_id) : 0),
+        promo_tag: promo_tag_for_payload,
+        promo_tag_found: tag_ids.present?,
+        promo_tag_id: (tag_ids.present? ? tag_ids.first : nil),
+        promo_tag_total_topics: (tag_ids.present? ? count_all_topics_with_any_tag(tag_ids) : 0),
+        promo_tag_ids: tag_ids,
+
         original_ids: original_ids,
         tagged_ids_in_original: original_ids.select { |tid| tagged_ids_set.include?(tid) },
         injected_ids: injected_ids,
@@ -542,10 +551,21 @@ after_initialize do
       TopicTag.where(tag_id: tag_id).count
     end
 
+    def self.count_all_topics_with_any_tag(tag_ids)
+      return 0 if tag_ids.blank?
+      TopicTag.where(tag_id: tag_ids).distinct.count(:topic_id)
+    end
+
     def self.fetch_tagged_topic_ids(topic_ids, tag_id)
       return [] if topic_ids.blank?
       return [] if tag_id.nil?
       TopicTag.where(topic_id: topic_ids, tag_id: tag_id).pluck(:topic_id)
+    end
+
+    def self.fetch_tagged_topic_ids_any_tag(topic_ids, tag_ids)
+      return [] if topic_ids.blank?
+      return [] if tag_ids.blank?
+      TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
     end
 
     # ---------- WATCHED CATEGORY HELPERS ----------
@@ -693,9 +713,9 @@ after_initialize do
     # Prefer-digest-list: eligible promo set inside digest list
     # ============================================================
     # Returns: [eligible_set, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
-    def self.eligible_promo_set_within_digest_list(user, tag_id:, digest_ids:, created_after: nil)
+    def self.eligible_promo_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
-      return [Set.new, 0, 0, [], false] if tag_id.nil?
+      return [Set.new, 0, 0, [], false] if tag_ids.blank?
       return [Set.new, 0, 0, [], false] if digest_ids.blank?
 
       guardian = Guardian.new(user)
@@ -706,7 +726,8 @@ after_initialize do
       scope =
         TopicTag
           .joins(:topic)
-          .where(topic_tags: { tag_id: tag_id, topic_id: digest_ids })
+          .where(topic_tags: { tag_id: tag_ids, topic_id: digest_ids })
+          .distinct
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
@@ -794,9 +815,9 @@ after_initialize do
     # Global picker (forum-wide)
     # ============================================================
     # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
-    def self.pick_random_promo_topic_ids(user, tag_id:, exclude_ids:, limit:, created_after: nil)
+    def self.pick_random_promo_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
-      return [[], 0, 0, [], false] if tag_id.nil?
+      return [[], 0, 0, [], false] if tag_ids.blank?
 
       guardian = Guardian.new(user)
 
@@ -806,8 +827,9 @@ after_initialize do
       topic_tag_scope =
         TopicTag
           .joins(:topic)
-          .where(topic_tags: { tag_id: tag_id })
+          .where(topic_tags: { tag_id: tag_ids })
           .where.not(topic_tags: { topic_id: exclude_ids })
+          .distinct
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
@@ -899,6 +921,8 @@ after_initialize do
       promo_tag_found:,
       promo_tag_id:,
       promo_tag_total_topics:,
+      promo_tag_ids:,
+
       original_ids:,
       tagged_ids_in_original:,
       injected_ids:,
@@ -964,7 +988,10 @@ after_initialize do
 
         debug: {
           promo_tag_found: promo_tag_found,
+
+          # Keep backward compatible scalar (first tag id), but ALSO send full array for clarity:
           promo_tag_id: promo_tag_id,
+          promo_tag_ids: promo_tag_ids,
           promo_tag_total_topics: promo_tag_total_topics,
 
           attempted_replace: attempted_replace,
