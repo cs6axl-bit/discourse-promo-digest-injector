@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed).
-# version: 1.2.9
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics.
+# version: 1.3.0
 # authors: you
 
 after_initialize do
@@ -29,7 +29,7 @@ after_initialize do
     PROMO_TAGS = ["helpful", "useful"]
 
     # If user is "watching" any categories, only pick promo-tagged topics from those categories.
-    # If user is watching none => fallback to all categories.
+    # If user is watching none => fallback to all categories (unless promo-pick mode says otherwise).
     USE_WATCHED_CATEGORIES = true
     INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
 
@@ -106,6 +106,16 @@ after_initialize do
     # Promo pool recency gate:
     # Only allow promo-candidate topics whose topics.created_at is AFTER the user's last sent digest.
     FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST = true
+
+    # ============================================================
+    # NEW: NO-WATCHED-CATEGORIES SHUFFLE
+    #
+    # If the user has ZERO watched categories (watching / watching_first_post),
+    # optionally shuffle the first N topics of the digest list and stop (no watched-category forcing applies).
+    # ============================================================
+    SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES = true
+    SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N      = 4
+    SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT = 100 # 0..100 (100 = always when enabled)
 
     # ============================================================
     # PROMO PICK STRATEGY SWITCH
@@ -370,6 +380,15 @@ after_initialize do
       fallback_picked = []
       used_fallback_outside_digest = false
 
+      # Debug fields for NO-WATCHED shuffle
+      no_watched_shuffle_enabled = (::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES == true)
+      no_watched_shuffle_top_n   = ::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N.to_i
+      no_watched_shuffle_top_n   = 4 if no_watched_shuffle_top_n <= 0
+      no_watched_shuffle_coinflip_percent = ::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT.to_i
+      no_watched_shuffle_coinflip_percent = 0 if no_watched_shuffle_coinflip_percent < 0
+      no_watched_shuffle_coinflip_percent = 100 if no_watched_shuffle_coinflip_percent > 100
+      no_watched_shuffle_applied = false
+
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
       # ============================================================
@@ -476,12 +495,27 @@ after_initialize do
 
       # ============================================================
       # Force first topic from watched categories (always evaluated)
+      # NEW: if user has NO watched categories and shuffle switch enabled -> shuffle first N and stop
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
 
       before_force_first = final_ids
-      final_ids = ensure_first_topic_from_watched_category(user, final_ids)
+
+      # If user has no watched categories at all, optionally shuffle top N and do nothing else.
+      if user_watched_category_ids.blank? && no_watched_shuffle_enabled && no_watched_shuffle_coinflip_percent > 0
+        if (no_watched_shuffle_coinflip_percent >= 100) || (rand(100) < no_watched_shuffle_coinflip_percent)
+          n = [no_watched_shuffle_top_n, final_ids.length].min
+          if n >= 2
+            shuffled = final_ids.first(n).shuffle
+            final_ids = shuffled + final_ids.drop(n)
+            no_watched_shuffle_applied = (final_ids != before_force_first)
+          end
+        end
+      else
+        final_ids = ensure_first_topic_from_watched_category(user, final_ids)
+      end
+
       forced_first_applied = (before_force_first != final_ids)
 
       first_topic_id_after_force = (final_ids.present? ? final_ids.first.to_i : nil)
@@ -551,7 +585,13 @@ after_initialize do
         digest_list_picked: digest_list_picked,
         fallback_picked: fallback_picked,
         used_fallback_outside_digest: used_fallback_outside_digest,
-        user_watched_category_ids: user_watched_category_ids
+        user_watched_category_ids: user_watched_category_ids,
+
+        # NEW: no-watched shuffle debug
+        no_watched_shuffle_enabled: no_watched_shuffle_enabled,
+        no_watched_shuffle_applied: no_watched_shuffle_applied,
+        no_watched_shuffle_top_n: no_watched_shuffle_top_n,
+        no_watched_shuffle_coinflip_percent: no_watched_shuffle_coinflip_percent
       )
 
       # If nothing to order, keep original relation (report already enqueued)
@@ -662,6 +702,8 @@ after_initialize do
     # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
     #     * try candidates created after last digest (random among newest N)
     #     * if none and SOFT_FALLBACK => random among newest N watched-category candidates regardless
+    # NOTE: If user has no watched categories, this method returns ids unchanged.
+    #       (The "shuffle if no watched" behavior is handled in maybe_adjust_digest_topics.)
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(user, ids)
       return ids if user.nil?
@@ -1022,7 +1064,13 @@ after_initialize do
       digest_list_picked:,
       fallback_picked:,
       used_fallback_outside_digest:,
-      user_watched_category_ids:
+      user_watched_category_ids:,
+
+      # NEW: no-watched shuffle debug
+      no_watched_shuffle_enabled:,
+      no_watched_shuffle_applied:,
+      no_watched_shuffle_top_n:,
+      no_watched_shuffle_coinflip_percent:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -1090,6 +1138,12 @@ after_initialize do
           forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
           forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
+
+          # NEW: no-watched shuffle debug
+          shuffle_if_no_watched_categories_enabled: no_watched_shuffle_enabled,
+          shuffle_if_no_watched_categories_applied: no_watched_shuffle_applied,
+          shuffle_if_no_watched_top_n: no_watched_shuffle_top_n,
+          shuffle_if_no_watched_coinflip_percent: no_watched_shuffle_coinflip_percent,
 
           first_topic_id_before_force: first_topic_id_before_force,
           first_topic_id_after_force: first_topic_id_after_force,
