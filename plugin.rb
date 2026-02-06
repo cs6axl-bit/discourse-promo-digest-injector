@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
-# version: 1.3.3
+# version: 1.3.4
 # authors: you
 
 after_initialize do
@@ -125,7 +125,7 @@ after_initialize do
     # ============================================================
     # PROMO PICK STRATEGY SWITCH
     #
-    # "global" (current): pick promo candidates from the whole forum (tagged topics), excluding digest ids.
+    # "global": pick promo candidates from the whole forum (tagged topics), excluding digest ids.
     #
     # "prefer_digest_list":
     #   1) FIRST try to satisfy replacement slots by SWAPPING IN eligible promo-tagged topics
@@ -135,16 +135,7 @@ after_initialize do
     # ============================================================
     PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
 
-    # ============================================================
-    # POSTGRES DISTINCT+RANDOM SAFETY
-    #
-    # When true, avoids ORDER BY RANDOM() on DISTINCT queries and does randomness in Ruby.
-    # Leave this true for Postgres compatibility.
-    # ============================================================
-    POSTGRES_SAFE_RANDOM_DISTINCT = true
-
-    # Hard cap for how many DISTINCT candidate IDs we pull into Ruby before shuffling/sampling.
-    # Keeps memory bounded if a promo tag matches tons of topics.
+    # Hard cap for how many candidate IDs we pull (then uniq/shuffle in Ruby)
     PROMO_CANDIDATE_SCAN_CAP = 500
   end
 
@@ -322,7 +313,6 @@ after_initialize do
       # Store initial digest topics (pre-injection) - if any
       persist_last_digest_topics(user, original_ids) if original_ids.present?
 
-      # Promo tags (OR: any tag qualifies)
       promo_tags =
         Array(::PromoDigestConfig::PROMO_TAGS)
           .map { |t| t.to_s.strip.downcase }
@@ -334,7 +324,6 @@ after_initialize do
       tags = promo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       tag_ids = tags.map(&:id).compact.uniq
 
-      # Always compute user's watched categories for reporting clarity
       user_watched_category_ids = watched_category_ids_for_user(user)
 
       # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
@@ -348,15 +337,6 @@ after_initialize do
         is_skipped_min_digests = (user_digest_count_val < min_digests_required)
       end
 
-      # ============================================================
-      # UPDATED (your request):
-      # tagged_ids_set/tagged_ids_in_original for the "already has promo in top MIN_POSITION" check
-      # will be computed as:
-      #   (promo-tagged) AND (topic.category_id IN user's watched categories)
-      # when user has watched categories.
-      #
-      # If the user has NO watched categories, we fall back to "tag-only" because there is no watched set.
-      # ============================================================
       tagged_ids_set =
         if original_ids.present? && tag_ids.present?
           if user_watched_category_ids.present?
@@ -375,14 +355,12 @@ after_initialize do
           []
         end
 
-      # Which promo tag name(s) matched each tagged topic already present in the digest list?
       original_topics_matched_tags =
         matched_promo_tag_names_by_topic(tagged_ids_in_original, promo_tags)
 
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
 
-      # Skip if any (tagged + watched-category) topic already appears in top MIN_POSITION
       has_tagged_in_top =
         if original_ids.present?
           original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
@@ -408,7 +386,6 @@ after_initialize do
       watched_category_ids = []
       watched_filter_applied = false
 
-      # Recency filter anchor
       last_digest_sent_at = last_digest_sent_at_for_user(user)
       created_after_last_digest_filter_enabled = (::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
       created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && last_digest_sent_at.present?)
@@ -417,14 +394,12 @@ after_initialize do
       promo_pick_mode = "global" if promo_pick_mode.empty?
       prefer_digest_list_mode = (promo_pick_mode == "prefer_digest_list")
 
-      # Debug fields for prefer_digest_list mode
       digest_list_candidates_count = 0
       digest_list_visible_count = 0
       digest_list_picked = []
       fallback_picked = []
       used_fallback_outside_digest = false
 
-      # Debug fields for NO-WATCHED shuffle
       no_watched_shuffle_enabled = (::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES == true)
       no_watched_shuffle_top_n   = ::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N.to_i
       no_watched_shuffle_top_n   = 4 if no_watched_shuffle_top_n <= 0
@@ -483,7 +458,7 @@ after_initialize do
                   pick_random_promo_topic_ids(
                     user,
                     tag_ids: tag_ids,
-                    exclude_ids: original_ids, # ensure "outside digest list"
+                    exclude_ids: original_ids,
                     limit: remaining_need,
                     created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
                   )
@@ -539,15 +514,12 @@ after_initialize do
 
       # ============================================================
       # Force first topic from watched categories (always evaluated)
-      # NEW: if user has NO watched categories and shuffle switch enabled -> shuffle first N
-      # NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
 
       before_force_first = final_ids
 
-      # If user has no watched categories at all, optionally shuffle top N and skip watched forcing.
       if user_watched_category_ids.blank? && no_watched_shuffle_enabled && no_watched_shuffle_coinflip_percent > 0
         if (no_watched_shuffle_coinflip_percent >= 100) || (rand(100) < no_watched_shuffle_coinflip_percent)
           n = [no_watched_shuffle_top_n, final_ids.length].min
@@ -558,9 +530,6 @@ after_initialize do
           end
         end
       else
-        # If the current first topic is promo-tagged (any promo tag),
-        # then during forced-first swapping we will PREFER swapping within promo-only watched candidates
-        # (fallback to any watched candidate if none).
         first_is_promo = false
         if final_ids.present? && tag_ids.present?
           first_is_promo = topic_has_any_tag?(final_ids.first, tag_ids)
@@ -580,11 +549,9 @@ after_initialize do
       first_topic_id_after_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_after_force = first_topic_is_watched_category?(user, final_ids)
 
-      # Which promo tag name(s) matched each injected topic (if any)?
       injected_topics_matched_tags =
         matched_promo_tag_names_by_topic(injected_ids, promo_tags)
 
-      # (Optional convenience) Which tag was found for the FIRST injected topic (single string)
       first_injected_tag_name =
         if injected_ids.present?
           Array(injected_topics_matched_tags[injected_ids.first.to_i]).first
@@ -592,14 +559,10 @@ after_initialize do
           nil
         end
 
-      # Persist final digest topics ONLY if different (prevents double-log of same digest list)
       if final_ids.present? && final_ids != original_ids
         persist_last_digest_topics(user, final_ids)
       end
 
-      # ============================================================
-      # Async summary post (ALWAYS tries to enqueue)
-      # ============================================================
       enqueue_summary_post(
         user: user,
         promo_tag: promo_tag_for_payload,
@@ -683,7 +646,6 @@ after_initialize do
       TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
     end
 
-    # Same as fetch_tagged_topic_ids_any_tag, but ALSO requires topics.category_id IN category_ids.
     def self.fetch_tagged_topic_ids_any_tag_in_categories(topic_ids, tag_ids, category_ids)
       return [] if topic_ids.blank?
       return [] if tag_ids.blank?
@@ -701,7 +663,6 @@ after_initialize do
       []
     end
 
-    # Returns { topic_id => ["helpful", "useful"] } but ONLY for promo_tag_names (case-insensitive)
     def self.matched_promo_tag_names_by_topic(topic_ids, promo_tag_names)
       ids = Array(topic_ids).map(&:to_i).reject(&:zero?).uniq
       names = Array(promo_tag_names).map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
@@ -757,14 +718,6 @@ after_initialize do
 
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
-    #
-    # NEW behavior:
-    # - If prefer_promo_only_if_first_is_promo is true:
-    #     * first try to pick the swap-in candidate from watched-category topics IN THE WINDOW
-    #       that are ALSO promo-tagged (any promo_tag_ids)
-    #     * if none, fallback to ANY watched-category candidate
-    #
-    # NOTE: This method is only called when the user has watched categories (not blank).
     # ----------------------------
     def self.ensure_first_topic_from_watched_category(
       user,
@@ -790,8 +743,6 @@ after_initialize do
       randomize_even_if_already_watched =
         (::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED == true)
 
-      # If "randomize even if already watched" is OFF:
-      # and first topic is already watched => DO NOTHING
       if !randomize_even_if_already_watched
         first_id = ids.first.to_i
         if first_id > 0
@@ -811,7 +762,6 @@ after_initialize do
       lookahead = ids.length if lookahead <= 0
       window_ids = ids.first([lookahead, ids.length].min)
 
-      # Pull id/category/created_at for candidates in window (secured)
       rows =
         Topic
           .visible
@@ -824,7 +774,6 @@ after_initialize do
       watched_rows = rows.select { |_tid, cid, _created| cid && watched_ids.include?(cid) }
       return ids if watched_rows.blank?
 
-      # If first topic is promo, prefer promo-only watched candidates in the window
       preferred_rows = watched_rows
       if prefer_promo_only_if_first_is_promo && promo_tag_ids.present?
         promo_ids =
@@ -850,7 +799,6 @@ after_initialize do
       top_n = ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOM_TOP_N.to_i
       top_n = 5 if top_n <= 0
 
-      # Sort newest first (created_at desc, then id desc)
       sort_newest_first = lambda do |arr|
         arr.sort_by do |tid, _cid, created|
           [-(created ? created.to_i : 0), -tid.to_i]
@@ -881,7 +829,6 @@ after_initialize do
       return ids if chosen.nil?
       chosen_id = chosen[0].to_i
       return ids if chosen_id <= 0
-
       return ids if ids.first.to_i == chosen_id
 
       new_ids = ids.dup
@@ -898,7 +845,6 @@ after_initialize do
     # ============================================================
     # Prefer-digest-list: eligible promo set inside digest list
     # ============================================================
-    # Returns: [eligible_set, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.eligible_promo_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
       return [Set.new, 0, 0, [], false] if tag_ids.blank?
@@ -921,11 +867,10 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
-      # POSTGRES FIX: avoid DISTINCT + ORDER BY RANDOM()
-      candidate_ids =
-        scope
-          .pluck("DISTINCT topic_tags.topic_id")
-          .map(&:to_i)
+      # POSTGRES FIX:
+      # - no ORDER BY RANDOM() with DISTINCT
+      # - do NOT embed DISTINCT inside pluck (avoid SELECT DISTINCT DISTINCT ...)
+      candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
 
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
@@ -950,7 +895,6 @@ after_initialize do
     # ============================================================
     # Prefer-digest-list: swap eligible promos into target indices
     # ============================================================
-    # Returns: [satisfied_indices, swapped_in_ids_for_targets, remaining_indices]
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
       return [[], [], replace_indices] if ids.blank?
       idxs = Array(replace_indices).map(&:to_i).uniq
@@ -1002,7 +946,6 @@ after_initialize do
     # ============================================================
     # Global picker (forum-wide)
     # ============================================================
-    # Returns [injected_ids, candidate_pool_count, visible_pool_count, watched_category_ids, watched_filter_applied]
     def self.pick_random_promo_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_ids.blank?
@@ -1028,17 +971,19 @@ after_initialize do
       scan_cap = ::PromoDigestConfig::PROMO_CANDIDATE_SCAN_CAP.to_i
       scan_cap = 500 if scan_cap <= 0
 
-      # POSTGRES FIX: avoid DISTINCT + ORDER BY RANDOM()
+      # POSTGRES FIX:
+      # - no ORDER BY RANDOM() with DISTINCT
+      # - do NOT embed DISTINCT inside pluck
       candidate_ids =
         topic_tag_scope
           .limit(scan_cap)
-          .pluck("DISTINCT topic_tags.topic_id")
+          .pluck("topic_tags.topic_id")
           .map(&:to_i)
+          .uniq
 
       candidate_pool_count = candidate_ids.length
       return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
 
-      # randomize in Ruby, then apply visibility filter
       candidate_ids = candidate_ids.shuffle
 
       visible_ids =
@@ -1077,7 +1022,6 @@ after_initialize do
         .order(Arel.sql(case_sql))
     end
 
-    # Robust URL builder (no Topic.slug_path dependency)
     def self.serialize_topics(ids)
       return [] if ids.blank?
 
@@ -1255,7 +1199,6 @@ after_initialize do
     end
   end
 
-  # Run only while digest is being generated
   module ::PromoDigestDigestWrapper
     def digest(user, opts = {})
       Thread.current[:promo_digest_in_digest] = true
@@ -1266,7 +1209,6 @@ after_initialize do
   end
   ::UserNotifications.prepend ::PromoDigestDigestWrapper
 
-  # Intercept Topic.for_digest(user, since, opts=nil)
   module ::PromoDigestForDigestOverride
     def for_digest(user, since, opts = nil)
       rel = super(user, since, opts)
