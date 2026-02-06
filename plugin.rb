@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
-# version: 1.3.2
+# version: 1.3.3
 # authors: you
 
 after_initialize do
@@ -134,6 +134,18 @@ after_initialize do
     #      and replace the remaining slots (replacement, no insertion).
     # ============================================================
     PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
+
+    # ============================================================
+    # POSTGRES DISTINCT+RANDOM SAFETY
+    #
+    # When true, avoids ORDER BY RANDOM() on DISTINCT queries and does randomness in Ruby.
+    # Leave this true for Postgres compatibility.
+    # ============================================================
+    POSTGRES_SAFE_RANDOM_DISTINCT = true
+
+    # Hard cap for how many DISTINCT candidate IDs we pull into Ruby before shuffling/sampling.
+    # Keeps memory bounded if a promo tag matches tons of topics.
+    PROMO_CANDIDATE_SCAN_CAP = 500
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -528,7 +540,7 @@ after_initialize do
       # ============================================================
       # Force first topic from watched categories (always evaluated)
       # NEW: if user has NO watched categories and shuffle switch enabled -> shuffle first N
-      # NEW: if first topic is promo, forced-first swapping prefers promo-only watched candidates
+      # NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
@@ -671,7 +683,6 @@ after_initialize do
       TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
     end
 
-    # NEW helper (your request):
     # Same as fetch_tagged_topic_ids_any_tag, but ALSO requires topics.category_id IN category_ids.
     def self.fetch_tagged_topic_ids_any_tag_in_categories(topic_ids, tag_ids, category_ids)
       return [] if topic_ids.blank?
@@ -747,11 +758,11 @@ after_initialize do
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
     #
-    # NEW behavior requested:
+    # NEW behavior:
     # - If prefer_promo_only_if_first_is_promo is true:
     #     * first try to pick the swap-in candidate from watched-category topics IN THE WINDOW
     #       that are ALSO promo-tagged (any promo_tag_ids)
-    #     * if none, fallback to ANY watched-category candidate (existing behavior)
+    #     * if none, fallback to ANY watched-category candidate
     #
     # NOTE: This method is only called when the user has watched categories (not blank).
     # ----------------------------
@@ -813,7 +824,7 @@ after_initialize do
       watched_rows = rows.select { |_tid, cid, _created| cid && watched_ids.include?(cid) }
       return ids if watched_rows.blank?
 
-      # NEW: if first topic is promo, prefer promo-only watched candidates in the window
+      # If first topic is promo, prefer promo-only watched candidates in the window
       preferred_rows = watched_rows
       if prefer_promo_only_if_first_is_promo && promo_tag_ids.present?
         promo_ids =
@@ -825,9 +836,6 @@ after_initialize do
             .to_set
 
         promo_rows = watched_rows.select { |tid, _cid, _created| promo_ids.include?(tid.to_i) }
-
-        # Only use promo_rows if it has at least one candidate.
-        # Otherwise fallback to watched_rows (requested behavior).
         preferred_rows = promo_rows if promo_rows.present?
       end
 
@@ -913,10 +921,11 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
+      # POSTGRES FIX: avoid DISTINCT + ORDER BY RANDOM()
       candidate_ids =
         scope
-          .order(Arel.sql("RANDOM()"))
-          .pluck("topic_tags.topic_id")
+          .pluck("DISTINCT topic_tags.topic_id")
+          .map(&:to_i)
 
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
@@ -927,6 +936,7 @@ after_initialize do
           .secured(guardian)
           .where(id: candidate_ids)
           .pluck(:id)
+          .map(&:to_i)
 
       visible_pool_count = visible_ids.length
       return [Set.new, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
@@ -1015,33 +1025,35 @@ after_initialize do
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
+      scan_cap = ::PromoDigestConfig::PROMO_CANDIDATE_SCAN_CAP.to_i
+      scan_cap = 500 if scan_cap <= 0
+
+      # POSTGRES FIX: avoid DISTINCT + ORDER BY RANDOM()
       candidate_ids =
         topic_tag_scope
-          .order(Arel.sql("RANDOM()"))
-          .limit(10)
-          .pluck("topic_tags.topic_id")
+          .limit(scan_cap)
+          .pluck("DISTINCT topic_tags.topic_id")
+          .map(&:to_i)
 
       candidate_pool_count = candidate_ids.length
       return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
 
-      visible_scope =
+      # randomize in Ruby, then apply visibility filter
+      candidate_ids = candidate_ids.shuffle
+
+      visible_ids =
         Topic
           .visible
           .secured(guardian)
           .where(id: candidate_ids)
           .where.not(id: exclude_ids)
+          .pluck(:id)
+          .map(&:to_i)
 
-      visible_scope = visible_scope.where(category_id: watched_ids) if watched_filter_applied
-
-      visible_ids = visible_scope.pluck(:id)
       visible_pool_count = visible_ids.length
       return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
 
-      injected_ids =
-        visible_scope
-          .order(Arel.sql("RANDOM()"))
-          .limit(limit)
-          .pluck(:id)
+      injected_ids = visible_ids.sample([limit.to_i, visible_ids.length].min)
 
       [injected_ids, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
     rescue => e
