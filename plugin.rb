@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics.
-# version: 1.3.0
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
+# version: 1.3.1
 # authors: you
 
 after_initialize do
@@ -29,7 +29,7 @@ after_initialize do
     PROMO_TAGS = ["helpful", "useful"]
 
     # If user is "watching" any categories, only pick promo-tagged topics from those categories.
-    # If user is watching none => fallback to all categories (unless promo-pick mode says otherwise).
+    # If user is watching none => fallback to all categories.
     USE_WATCHED_CATEGORIES = true
     INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
 
@@ -75,13 +75,12 @@ after_initialize do
     # 100 => always apply
     FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
 
-    # NEW:
     # If true:
     #   even when the current first topic is already in a watched category,
     #   we STILL attempt to "refresh" position 0 by choosing randomly among
     #   the newest N watched-category topics in the lookahead window.
     #
-    # If false (default):
+    # If false:
     #   if the first topic is already watched, do nothing.
     FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED = true
 
@@ -108,10 +107,10 @@ after_initialize do
     FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST = true
 
     # ============================================================
-    # NEW: NO-WATCHED-CATEGORIES SHUFFLE
+    # NO-WATCHED-CATEGORIES SHUFFLE
     #
     # If the user has ZERO watched categories (watching / watching_first_post),
-    # optionally shuffle the first N topics of the digest list and stop (no watched-category forcing applies).
+    # optionally shuffle the first N topics of the digest list.
     # ============================================================
     SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES = true
     SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N      = 4
@@ -273,6 +272,20 @@ after_initialize do
       watched_ids.include?(cid)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] first_topic_is_watched_category? failed: #{e.class}: #{e.message}")
+      false
+    end
+
+    # ----------------------------
+    # helper: does a topic have ANY of the given tags?
+    # ----------------------------
+    def self.topic_has_any_tag?(topic_id, tag_ids)
+      tid = topic_id.to_i
+      ids = Array(tag_ids).map(&:to_i).reject(&:zero?).uniq
+      return false if tid <= 0 || ids.blank?
+
+      TopicTag.where(topic_id: tid, tag_id: ids).limit(1).exists?
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] topic_has_any_tag? failed: #{e.class}: #{e.message}")
       false
     end
 
@@ -495,14 +508,15 @@ after_initialize do
 
       # ============================================================
       # Force first topic from watched categories (always evaluated)
-      # NEW: if user has NO watched categories and shuffle switch enabled -> shuffle first N and stop
+      # NEW: if user has NO watched categories and shuffle switch enabled -> shuffle first N
+      # NEW: if first topic is promo, forced-first swapping prefers promo-only watched candidates
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
 
       before_force_first = final_ids
 
-      # If user has no watched categories at all, optionally shuffle top N and do nothing else.
+      # If user has no watched categories at all, optionally shuffle top N and skip watched forcing.
       if user_watched_category_ids.blank? && no_watched_shuffle_enabled && no_watched_shuffle_coinflip_percent > 0
         if (no_watched_shuffle_coinflip_percent >= 100) || (rand(100) < no_watched_shuffle_coinflip_percent)
           n = [no_watched_shuffle_top_n, final_ids.length].min
@@ -513,7 +527,21 @@ after_initialize do
           end
         end
       else
-        final_ids = ensure_first_topic_from_watched_category(user, final_ids)
+        # If the current first topic is promo-tagged (any promo tag),
+        # then during forced-first swapping we will PREFER swapping within promo-only watched candidates
+        # (fallback to any watched candidate if none).
+        first_is_promo = false
+        if final_ids.present? && tag_ids.present?
+          first_is_promo = topic_has_any_tag?(final_ids.first, tag_ids)
+        end
+
+        final_ids =
+          ensure_first_topic_from_watched_category(
+            user,
+            final_ids,
+            promo_tag_ids: tag_ids,
+            prefer_promo_only_if_first_is_promo: first_is_promo
+          )
       end
 
       forced_first_applied = (before_force_first != final_ids)
@@ -556,7 +584,6 @@ after_initialize do
         injected_ids: injected_ids,
         final_ids: final_ids,
 
-        # NEW: which tag(s) matched
         original_topics_matched_tags: original_topics_matched_tags,
         injected_topics_matched_tags: injected_topics_matched_tags,
 
@@ -587,16 +614,13 @@ after_initialize do
         used_fallback_outside_digest: used_fallback_outside_digest,
         user_watched_category_ids: user_watched_category_ids,
 
-        # NEW: no-watched shuffle debug
         no_watched_shuffle_enabled: no_watched_shuffle_enabled,
         no_watched_shuffle_applied: no_watched_shuffle_applied,
         no_watched_shuffle_top_n: no_watched_shuffle_top_n,
         no_watched_shuffle_coinflip_percent: no_watched_shuffle_coinflip_percent
       )
 
-      # If nothing to order, keep original relation (report already enqueued)
       return original_relation if final_ids.blank?
-
       build_ordered_relation(user, final_ids)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] maybe_adjust_digest_topics error: #{e.class}: #{e.message}")
@@ -617,20 +641,9 @@ after_initialize do
       Tag.where("LOWER(name) = ?", n).first
     end
 
-    def self.count_all_topics_with_tag(tag_id)
-      return 0 if tag_id.nil?
-      TopicTag.where(tag_id: tag_id).count
-    end
-
     def self.count_all_topics_with_any_tag(tag_ids)
       return 0 if tag_ids.blank?
       TopicTag.where(tag_id: tag_ids).distinct.count(:topic_id)
-    end
-
-    def self.fetch_tagged_topic_ids(topic_ids, tag_id)
-      return [] if topic_ids.blank?
-      return [] if tag_id.nil?
-      TopicTag.where(topic_id: topic_ids, tag_id: tag_id).pluck(:topic_id)
     end
 
     def self.fetch_tagged_topic_ids_any_tag(topic_ids, tag_ids)
@@ -695,17 +708,21 @@ after_initialize do
 
     # ----------------------------
     # Ensure first digest topic is from a watched category (swap-based)
-    # - honors FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT
-    # - NEW: if FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED is true,
-    #        we do not early-return when the first topic is already watched
-    # - Selection: random among newest N watched-category topics in lookahead window
-    # - if REQUIRE_CREATED_AFTER_LAST_DIGEST and last digest exists:
-    #     * try candidates created after last digest (random among newest N)
-    #     * if none and SOFT_FALLBACK => random among newest N watched-category candidates regardless
-    # NOTE: If user has no watched categories, this method returns ids unchanged.
-    #       (The "shuffle if no watched" behavior is handled in maybe_adjust_digest_topics.)
+    #
+    # NEW behavior requested:
+    # - If prefer_promo_only_if_first_is_promo is true:
+    #     * first try to pick the swap-in candidate from watched-category topics IN THE WINDOW
+    #       that are ALSO promo-tagged (any promo_tag_ids)
+    #     * if none, fallback to ANY watched-category candidate (existing behavior)
+    #
+    # NOTE: This method is only called when the user has watched categories (not blank).
     # ----------------------------
-    def self.ensure_first_topic_from_watched_category(user, ids)
+    def self.ensure_first_topic_from_watched_category(
+      user,
+      ids,
+      promo_tag_ids: nil,
+      prefer_promo_only_if_first_is_promo: false
+    )
       return ids if user.nil?
       return ids if ids.blank?
       return ids unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY
@@ -758,6 +775,24 @@ after_initialize do
       watched_rows = rows.select { |_tid, cid, _created| cid && watched_ids.include?(cid) }
       return ids if watched_rows.blank?
 
+      # NEW: if first topic is promo, prefer promo-only watched candidates in the window
+      preferred_rows = watched_rows
+      if prefer_promo_only_if_first_is_promo && promo_tag_ids.present?
+        promo_ids =
+          TopicTag
+            .where(topic_id: watched_rows.map { |tid, _cid, _c| tid }, tag_id: Array(promo_tag_ids).map(&:to_i))
+            .distinct
+            .pluck(:topic_id)
+            .map(&:to_i)
+            .to_set
+
+        promo_rows = watched_rows.select { |tid, _cid, _created| promo_ids.include?(tid.to_i) }
+
+        # Only use promo_rows if it has at least one candidate.
+        # Otherwise fallback to watched_rows (requested behavior).
+        preferred_rows = promo_rows if promo_rows.present?
+      end
+
       require_created_after = (::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST == true)
       soft_fallback = (::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK == true)
 
@@ -785,16 +820,20 @@ after_initialize do
       chosen = nil
 
       if require_created_after && last_ts.present?
-        newer = watched_rows.select { |_tid, _cid, created| created.present? && created > last_ts }
+        newer = preferred_rows.select { |_tid, _cid, created| created.present? && created > last_ts }
         if newer.present?
           chosen = pick_random_from_top.call(newer)
         elsif soft_fallback
-          chosen = pick_random_from_top.call(watched_rows)
+          # IMPORTANT: fallback should respect "prefer promo-only if first is promo"
+          # but if preferred_rows == promo_rows and that has no "newer" candidates,
+          # we still fallback within preferred_rows first; and if preferred_rows was promo_rows
+          # but empty (it won't be), we'd already have fallen back to watched_rows above.
+          chosen = pick_random_from_top.call(preferred_rows)
         else
           return ids
         end
       else
-        chosen = pick_random_from_top.call(watched_rows)
+        chosen = pick_random_from_top.call(preferred_rows)
       end
 
       return ids if chosen.nil?
@@ -1035,7 +1074,6 @@ after_initialize do
       injected_ids:,
       final_ids:,
 
-      # NEW: which tag(s) matched which topic(s)
       original_topics_matched_tags:,
       injected_topics_matched_tags:,
 
@@ -1066,7 +1104,6 @@ after_initialize do
       used_fallback_outside_digest:,
       user_watched_category_ids:,
 
-      # NEW: no-watched shuffle debug
       no_watched_shuffle_enabled:,
       no_watched_shuffle_applied:,
       no_watched_shuffle_top_n:,
@@ -1084,8 +1121,6 @@ after_initialize do
         datetime_utc: now_iso,
 
         promo_tag: promo_tag,
-
-        # single-string convenience: which tag was found on the FIRST injected topic (if any)
         first_injected_tag_name: first_injected_tag_name,
 
         is_skipped_haspromo: is_skipped_haspromo,
@@ -1094,7 +1129,6 @@ after_initialize do
         min_digests_required: min_digests_required,
         user_digest_count: user_digest_count,
 
-        # NEW top-level fields for DB columns:
         forced_first_applied: forced_first_applied,
         first_topic_id_before_force: first_topic_id_before_force,
         first_topic_id_after_force: first_topic_id_after_force,
@@ -1109,14 +1143,11 @@ after_initialize do
 
         debug: {
           promo_tag_found: promo_tag_found,
-
-          # Backward compatible scalar (first tag id), but ALSO send full array + names:
           promo_tag_id: promo_tag_id,
           promo_tag_ids: promo_tag_ids,
           promo_tag_names: promo_tag_names,
           promo_tag_total_topics: promo_tag_total_topics,
 
-          # NEW: which tag(s) matched which topic(s)
           original_topics_matched_tags: original_topics_matched_tags,
           injected_topics_matched_tags: injected_topics_matched_tags,
 
@@ -1124,7 +1155,6 @@ after_initialize do
           candidate_pool_count: candidate_pool_count,
           visible_pool_count: visible_pool_count,
 
-          # clarity: always include the user's watched categories, even if promo injection was skipped
           user_watched_category_ids: user_watched_category_ids,
 
           watched_category_ids: watched_category_ids,
@@ -1139,7 +1169,6 @@ after_initialize do
           forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
           forced_first_topic_applied: forced_first_applied,
 
-          # NEW: no-watched shuffle debug
           shuffle_if_no_watched_categories_enabled: no_watched_shuffle_enabled,
           shuffle_if_no_watched_categories_applied: no_watched_shuffle_applied,
           shuffle_if_no_watched_top_n: no_watched_shuffle_top_n,
