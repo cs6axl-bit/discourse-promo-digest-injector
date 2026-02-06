@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
-# version: 1.3.1
+# version: 1.3.2
 # authors: you
 
 after_initialize do
@@ -34,6 +34,12 @@ after_initialize do
     INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
 
     # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
+    #
+    # UPDATED (your request):
+    # "promo-tagged topic exists" for skip-check is now:
+    #   (has promo tag) AND (topic category is in user's watched categories),
+    # BUT only when user has watched categories.
+    # If user has zero watched categories, this check falls back to tag-only (because there is no watched set).
     MIN_POSITION = 3
 
     # If above condition fails: in this % of cases do nothing
@@ -191,7 +197,7 @@ after_initialize do
     end
 
     # ----------------------------
-    # Last digest sent timestamp (used for promo pool filter + optional forced-first constraint)
+    # Last digest sent timestamp
     # ----------------------------
     def self.last_digest_sent_at_for_user(user)
       return nil if user.nil?
@@ -216,7 +222,7 @@ after_initialize do
     end
 
     # ----------------------------
-    # Store last 50 digest topics (newest digest first; duplicates allowed)
+    # Store last 50 digest topics
     # ----------------------------
     def self.persist_last_digest_topics(user, topic_ids)
       return if user.nil?
@@ -330,9 +336,22 @@ after_initialize do
         is_skipped_min_digests = (user_digest_count_val < min_digests_required)
       end
 
+      # ============================================================
+      # UPDATED (your request):
+      # tagged_ids_set/tagged_ids_in_original for the "already has promo in top MIN_POSITION" check
+      # will be computed as:
+      #   (promo-tagged) AND (topic.category_id IN user's watched categories)
+      # when user has watched categories.
+      #
+      # If the user has NO watched categories, we fall back to "tag-only" because there is no watched set.
+      # ============================================================
       tagged_ids_set =
         if original_ids.present? && tag_ids.present?
-          fetch_tagged_topic_ids_any_tag(original_ids, tag_ids).to_set
+          if user_watched_category_ids.present?
+            fetch_tagged_topic_ids_any_tag_in_categories(original_ids, tag_ids, user_watched_category_ids).to_set
+          else
+            fetch_tagged_topic_ids_any_tag(original_ids, tag_ids).to_set
+          end
         else
           Set.new
         end
@@ -351,7 +370,7 @@ after_initialize do
       min_position = ::PromoDigestConfig::MIN_POSITION.to_i
       min_position = 3 if min_position <= 0
 
-      # Skip if any promo-tagged topic already appears in top MIN_POSITION
+      # Skip if any (tagged + watched-category) topic already appears in top MIN_POSITION
       has_tagged_in_top =
         if original_ids.present?
           original_ids.first(min_position).any? { |tid| tagged_ids_set.include?(tid) }
@@ -652,6 +671,25 @@ after_initialize do
       TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
     end
 
+    # NEW helper (your request):
+    # Same as fetch_tagged_topic_ids_any_tag, but ALSO requires topics.category_id IN category_ids.
+    def self.fetch_tagged_topic_ids_any_tag_in_categories(topic_ids, tag_ids, category_ids)
+      return [] if topic_ids.blank?
+      return [] if tag_ids.blank?
+      cids = Array(category_ids).map(&:to_i).reject(&:zero?).uniq
+      return [] if cids.blank?
+
+      TopicTag
+        .joins(:topic)
+        .where(topic_tags: { topic_id: topic_ids, tag_id: tag_ids })
+        .where(topics: { category_id: cids })
+        .distinct
+        .pluck("topic_tags.topic_id")
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] fetch_tagged_topic_ids_any_tag_in_categories failed: #{e.class}: #{e.message}")
+      []
+    end
+
     # Returns { topic_id => ["helpful", "useful"] } but ONLY for promo_tag_names (case-insensitive)
     def self.matched_promo_tag_names_by_topic(topic_ids, promo_tag_names)
       ids = Array(topic_ids).map(&:to_i).reject(&:zero?).uniq
@@ -824,10 +862,6 @@ after_initialize do
         if newer.present?
           chosen = pick_random_from_top.call(newer)
         elsif soft_fallback
-          # IMPORTANT: fallback should respect "prefer promo-only if first is promo"
-          # but if preferred_rows == promo_rows and that has no "newer" candidates,
-          # we still fallback within preferred_rows first; and if preferred_rows was promo_rows
-          # but empty (it won't be), we'd already have fallen back to watched_rows above.
           chosen = pick_random_from_top.call(preferred_rows)
         else
           return ids
