@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 digest topic IDs per user (newest digest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched).
-# version: 1.3.4
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). NEW: stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). NEW: enforce min % of watched-category topics in digest list.
+# version: 1.3.6
 # authors: you
 
 after_initialize do
@@ -35,11 +35,11 @@ after_initialize do
 
     # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
     #
-    # UPDATED (your request):
+    # UPDATED:
     # "promo-tagged topic exists" for skip-check is now:
     #   (has promo tag) AND (topic category is in user's watched categories),
     # BUT only when user has watched categories.
-    # If user has zero watched categories, this check falls back to tag-only (because there is no watched set).
+    # If user has zero watched categories, this check falls back to tag-only.
     MIN_POSITION = 3
 
     # If above condition fails: in this % of cases do nothing
@@ -69,9 +69,21 @@ after_initialize do
     # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
     SEND_IDS_ONLY = true
 
-    # Store last 50 digest topics per user (IDs only), newest digest first, duplicates allowed
+    # ============================================================
+    # PERSISTED HISTORY (FINAL DIGEST CONTENTS)
+    # ============================================================
+
+    # Store last 50 FINAL digest topics per user (IDs only), newest digest first, duplicates allowed
     LAST_DIGEST_TOPICS_FIELD = "promo_digest_last50_topic_ids" # JSON array of ints (string)
     LAST_DIGEST_TOPICS_MAX   = 50
+
+    # Store last 10 FINAL position-0 topic ids per user, newest first, duplicates allowed
+    LAST_DIGEST_FIRST_TOPICS_FIELD = "promo_digest_last10_first_topic_ids" # JSON array of ints (string)
+    LAST_DIGEST_FIRST_TOPICS_MAX   = 10
+
+    # ============================================================
+    # Force first topic logic
+    # ============================================================
 
     # Always ensure first digest topic is from a watched category (if user watches any)
     FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY = true
@@ -120,7 +132,7 @@ after_initialize do
     # ============================================================
     SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES = true
     SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N      = 4
-    SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT = 100 # 0..100 (100 = always when enabled)
+    SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT = 100 # 0..100
 
     # ============================================================
     # PROMO PICK STRATEGY SWITCH
@@ -137,6 +149,25 @@ after_initialize do
 
     # Hard cap for how many candidate IDs we pull (then uniq/shuffle in Ruby)
     PROMO_CANDIDATE_SCAN_CAP = 500
+
+    # ============================================================
+    # WATCHED-CATEGORY PERCENT ENFORCER (RUNS AFTER PROMO INJECTION, BEFORE FIRST-TOPIC LOGIC)
+    #
+    # Goal: ensure at least MIN% of topics in the final digest list are from watched categories.
+    # Strategy:
+    #   1) Try to REPLACE non-watched items with watched-category candidates found in a digest LOOKAHEAD window
+    #      (i.e., beyond the first :limit results from Topic.for_digest).
+    #   2) If still short, pull watched-category topics from the forum (visible+secured),
+    #      restricted to created_at > last_digest (when last_digest exists).
+    # ============================================================
+    ENFORCE_MIN_WATCHED_CATEGORY_PERCENT = true
+    MIN_WATCHED_CATEGORY_PERCENT         = 50 # 0..100
+
+    # How many extra items to look at from the digest relation beyond the main limit (step 1)
+    WATCHED_ENFORCE_LOOKAHEAD_EXTRA      = 100
+
+    # Step 2: how many forum candidates to scan (newest first)
+    WATCHED_ENFORCE_FORUM_SCAN_CAP       = 500
   end
 
   PLUGIN_NAME = "discourse-promo-digest-injector"
@@ -225,7 +256,7 @@ after_initialize do
     end
 
     # ----------------------------
-    # Store last 50 digest topics
+    # Store last 50 FINAL digest topics (newest first, duplicates allowed)
     # ----------------------------
     def self.persist_last_digest_topics(user, topic_ids)
       return if user.nil?
@@ -260,6 +291,42 @@ after_initialize do
       end
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] persist_last_digest_topics failed: #{e.class}: #{e.message}")
+    end
+
+    # ----------------------------
+    # Store last 10 FINAL position-0 topic ids (newest first, duplicates allowed)
+    # ----------------------------
+    def self.persist_last_digest_first_topic(user, first_topic_id)
+      return if user.nil?
+
+      field = ::PromoDigestConfig::LAST_DIGEST_FIRST_TOPICS_FIELD.to_s
+      return if field.strip.empty?
+
+      max_n = ::PromoDigestConfig::LAST_DIGEST_FIRST_TOPICS_MAX.to_i
+      max_n = 10 if max_n <= 0
+
+      tid = first_topic_id.to_i
+      return if tid <= 0
+
+      User.transaction do
+        u = User.lock.find(user.id)
+
+        prev_json = u.custom_fields[field].to_s
+        prev =
+          begin
+            JSON.parse(prev_json)
+          rescue
+            []
+          end
+        prev = Array(prev).map(&:to_i).reject(&:zero?)
+
+        combined = ([tid] + prev).first(max_n)
+
+        u.custom_fields[field] = combined.to_json
+        u.save_custom_fields(true)
+      end
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] persist_last_digest_first_topic failed: #{e.class}: #{e.message}")
     end
 
     # ----------------------------
@@ -298,6 +365,173 @@ after_initialize do
       false
     end
 
+    # ============================================================
+    # Watched-category percent enforcer
+    # ============================================================
+    def self.enforce_min_watched_category_percent(user, ids, base_relation, limit:, last_digest_sent_at:)
+      return [ids, false, {}, []] if user.nil?
+      return [ids, false, {}, []] if ids.blank?
+      return [ids, false, {}, []] unless ::PromoDigestConfig::ENFORCE_MIN_WATCHED_CATEGORY_PERCENT == true
+
+      watched_ids = watched_category_ids_for_user(user)
+      return [ids, false, {}, watched_ids] if watched_ids.blank?
+
+      pct = ::PromoDigestConfig::MIN_WATCHED_CATEGORY_PERCENT.to_i
+      pct = 0 if pct < 0
+      pct = 100 if pct > 100
+      return [ids, false, {}, watched_ids] if pct <= 0
+
+      guardian = Guardian.new(user)
+
+      rows = Topic.visible.secured(guardian).where(id: ids).pluck(:id, :category_id)
+      tid_to_cid = {}
+      rows.each { |tid, cid| tid_to_cid[tid.to_i] = cid.to_i if tid && cid }
+
+      total = ids.length
+      target_count = ((total * pct) / 100.0).ceil
+
+      current_watched_count =
+        ids.count do |tid|
+          cid = tid_to_cid[tid.to_i]
+          cid && watched_ids.include?(cid)
+        end
+
+      debug = {
+        enabled: true,
+        min_percent: pct,
+        total_topics: total,
+        target_watched_count: target_count,
+        watched_count_before: current_watched_count,
+        watched_count_after: current_watched_count,
+        replaced_positions: [],
+        replaced_out_ids: [],
+        replaced_in_ids: [],
+        replaced_source: [] # "lookahead" or "forum"
+      }
+
+      return [ids, false, debug, watched_ids] if current_watched_count >= target_count
+
+      need = target_count - current_watched_count
+      new_ids = ids.dup
+
+      replace_positions = []
+      new_ids.each_with_index do |tid, idx|
+        cid = tid_to_cid[tid.to_i]
+        is_watched = (cid && watched_ids.include?(cid))
+        replace_positions << idx unless is_watched
+      end
+      return [ids, false, debug, watched_ids] if replace_positions.blank?
+
+      # Step 1: digest lookahead
+      lookahead_extra = ::PromoDigestConfig::WATCHED_ENFORCE_LOOKAHEAD_EXTRA.to_i
+      lookahead_extra = 0 if lookahead_extra < 0
+
+      if lookahead_extra > 0 && base_relation.present?
+        extra_ids =
+          base_relation
+            .limit(limit.to_i + lookahead_extra)
+            .pluck(:id)
+            .map(&:to_i)
+
+        extra_ids = extra_ids.drop(limit.to_i)
+        extra_ids = extra_ids.reject(&:zero?)
+        extra_ids = extra_ids - new_ids
+
+        if extra_ids.present?
+          extra_visible =
+            Topic
+              .visible
+              .secured(guardian)
+              .where(id: extra_ids, category_id: watched_ids)
+              .pluck(:id)
+              .map(&:to_i)
+
+          if extra_visible.present?
+            extra_visible_sorted =
+              Topic
+                .visible
+                .secured(guardian)
+                .where(id: extra_visible)
+                .order(created_at: :desc, id: :desc)
+                .pluck(:id)
+                .map(&:to_i)
+
+            extra_visible_sorted.each do |cand_id|
+              break if need <= 0
+              break if replace_positions.empty?
+
+              pos = replace_positions.shift
+              out_id = new_ids[pos]
+              new_ids[pos] = cand_id
+
+              debug[:replaced_positions] << pos
+              debug[:replaced_out_ids] << out_id
+              debug[:replaced_in_ids] << cand_id
+              debug[:replaced_source] << "lookahead"
+
+              need -= 1
+            end
+          end
+        end
+      end
+
+      # Step 2: forum-wide watched categories, created_after_last_digest if known
+      if need > 0 && replace_positions.present?
+        scan_cap = ::PromoDigestConfig::WATCHED_ENFORCE_FORUM_SCAN_CAP.to_i
+        scan_cap = 500 if scan_cap <= 0
+
+        scope =
+          Topic
+            .visible
+            .secured(guardian)
+            .where(category_id: watched_ids)
+            .where.not(id: new_ids)
+
+        scope = scope.where("topics.created_at > ?", last_digest_sent_at) if last_digest_sent_at.present?
+
+        forum_candidates =
+          scope
+            .order(created_at: :desc, id: :desc)
+            .limit(scan_cap)
+            .pluck(:id)
+            .map(&:to_i)
+
+        forum_candidates.each do |cand_id|
+          break if need <= 0
+          break if replace_positions.empty?
+
+          pos = replace_positions.shift
+          out_id = new_ids[pos]
+          new_ids[pos] = cand_id
+
+          debug[:replaced_positions] << pos
+          debug[:replaced_out_ids] << out_id
+          debug[:replaced_in_ids] << cand_id
+          debug[:replaced_source] << "forum"
+
+          need -= 1
+        end
+      end
+
+      rows2 = Topic.visible.secured(guardian).where(id: new_ids).pluck(:id, :category_id)
+      tid_to_cid2 = {}
+      rows2.each { |tid, cid| tid_to_cid2[tid.to_i] = cid.to_i if tid && cid }
+
+      watched_after =
+        new_ids.count do |tid|
+          cid = tid_to_cid2[tid.to_i]
+          cid && watched_ids.include?(cid)
+        end
+
+      debug[:watched_count_after] = watched_after
+      applied = (new_ids != ids)
+
+      [new_ids, applied, debug, watched_ids]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] enforce_min_watched_category_percent failed: #{e.class}: #{e.message}")
+      [ids, false, {}, watched_category_ids_for_user(user)]
+    end
+
     # ----------------------------
     # Main hook
     # ----------------------------
@@ -309,9 +543,6 @@ after_initialize do
       limit = extract_limit(opts)
       original_ids = original_relation.limit(limit).pluck(:id)
       original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
-
-      # Store initial digest topics (pre-injection) - if any
-      persist_last_digest_topics(user, original_ids) if original_ids.present?
 
       promo_tags =
         Array(::PromoDigestConfig::PROMO_TAGS)
@@ -407,6 +638,9 @@ after_initialize do
       no_watched_shuffle_coinflip_percent = 0 if no_watched_shuffle_coinflip_percent < 0
       no_watched_shuffle_coinflip_percent = 100 if no_watched_shuffle_coinflip_percent > 100
       no_watched_shuffle_applied = false
+
+      watched_percent_enforcer_applied = false
+      watched_percent_debug = {}
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
@@ -513,6 +747,22 @@ after_initialize do
       end
 
       # ============================================================
+      # Enforce minimum % watched-category topics (AFTER promo, BEFORE first-topic logic)
+      # ============================================================
+      begin
+        final_ids, watched_percent_enforcer_applied, watched_percent_debug, _ =
+          enforce_min_watched_category_percent(
+            user,
+            final_ids,
+            original_relation,
+            limit: limit,
+            last_digest_sent_at: last_digest_sent_at
+          )
+      rescue => e
+        Rails.logger.warn("[#{PLUGIN_NAME}] watched-percent enforcer wrapper failed: #{e.class}: #{e.message}")
+      end
+
+      # ============================================================
       # Force first topic from watched categories (always evaluated)
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
@@ -559,8 +809,12 @@ after_initialize do
           nil
         end
 
-      if final_ids.present? && final_ids != original_ids
+      # ============================================================
+      # PERSIST FINAL DIGEST CONTENTS (your requirement)
+      # ============================================================
+      if final_ids.present?
         persist_last_digest_topics(user, final_ids)
+        persist_last_digest_first_topic(user, final_ids.first)
       end
 
       enqueue_summary_post(
@@ -611,7 +865,10 @@ after_initialize do
         no_watched_shuffle_enabled: no_watched_shuffle_enabled,
         no_watched_shuffle_applied: no_watched_shuffle_applied,
         no_watched_shuffle_top_n: no_watched_shuffle_top_n,
-        no_watched_shuffle_coinflip_percent: no_watched_shuffle_coinflip_percent
+        no_watched_shuffle_coinflip_percent: no_watched_shuffle_coinflip_percent,
+
+        watched_percent_enforcer_applied: watched_percent_enforcer_applied,
+        watched_percent_debug: watched_percent_debug
       )
 
       return original_relation if final_ids.blank?
@@ -867,11 +1124,7 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
-      # POSTGRES FIX:
-      # - no ORDER BY RANDOM() with DISTINCT
-      # - do NOT embed DISTINCT inside pluck (avoid SELECT DISTINCT DISTINCT ...)
       candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
-
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
 
@@ -971,9 +1224,6 @@ after_initialize do
       scan_cap = ::PromoDigestConfig::PROMO_CANDIDATE_SCAN_CAP.to_i
       scan_cap = 500 if scan_cap <= 0
 
-      # POSTGRES FIX:
-      # - no ORDER BY RANDOM() with DISTINCT
-      # - do NOT embed DISTINCT inside pluck
       candidate_ids =
         topic_tag_scope
           .limit(scan_cap)
@@ -999,7 +1249,6 @@ after_initialize do
       return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
 
       injected_ids = visible_ids.sample([limit.to_i, visible_ids.length].min)
-
       [injected_ids, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] pick_random_promo_topic_ids failed: #{e.class}: #{e.message}")
@@ -1097,7 +1346,10 @@ after_initialize do
       no_watched_shuffle_enabled:,
       no_watched_shuffle_applied:,
       no_watched_shuffle_top_n:,
-      no_watched_shuffle_coinflip_percent:
+      no_watched_shuffle_coinflip_percent:,
+
+      watched_percent_enforcer_applied:,
+      watched_percent_debug:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -1151,6 +1403,10 @@ after_initialize do
           watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
           watched_filter_applied: watched_filter_applied,
 
+          watched_percent_enforcer_enabled: ::PromoDigestConfig::ENFORCE_MIN_WATCHED_CATEGORY_PERCENT,
+          watched_percent_enforcer_applied: watched_percent_enforcer_applied,
+          watched_percent_enforcer_debug: watched_percent_debug,
+
           forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
           forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
           force_first_topic_randomize_even_if_already_watched: ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED,
@@ -1163,11 +1419,6 @@ after_initialize do
           shuffle_if_no_watched_categories_applied: no_watched_shuffle_applied,
           shuffle_if_no_watched_top_n: no_watched_shuffle_top_n,
           shuffle_if_no_watched_coinflip_percent: no_watched_shuffle_coinflip_percent,
-
-          first_topic_id_before_force: first_topic_id_before_force,
-          first_topic_id_after_force: first_topic_id_after_force,
-          first_topic_was_watched_before_force: first_topic_was_watched_before_force,
-          first_topic_was_watched_after_force: first_topic_was_watched_after_force,
 
           created_after_last_digest_filter_enabled: created_after_last_digest_filter_enabled,
           created_after_last_digest_filter_applied: created_after_last_digest_filter_applied,
