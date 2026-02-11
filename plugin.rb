@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). NEW: stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). NEW: enforce min % of watched-category topics in digest list.
-# version: 1.3.6
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). NEW: stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). NEW: if user has NO watched categories, can optionally shuffle the first N digest topics. NEW: if first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). NEW: enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload to explain duplicate rows.
+# version: 1.3.7
 # authors: you
 
 after_initialize do
@@ -10,6 +10,9 @@ after_initialize do
   require "json"
   require "set"
   require "time"
+  require "securerandom"
+
+  PLUGIN_NAME = "discourse-promo-digest-injector"
 
   # ============================================================
   # CONFIG (EDIT HERE)
@@ -103,7 +106,6 @@ after_initialize do
     FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED = true
 
     # Choose randomly among the newest N watched-category candidates in the lookahead window.
-    # (If fewer than N exist, it randomizes among what's available.)
     FORCE_FIRST_TOPIC_RANDOM_TOP_N = 5
 
     # If true, the forced-first watched-category candidate must have:
@@ -112,9 +114,6 @@ after_initialize do
     FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = true
 
     # soft fallback when REQUIRE_CREATED... is enabled but no candidates match:
-    # - First try "created_at > last_digest" candidates.
-    # - If none found, fallback to ANY watched-category topic within lookahead window.
-    # In both cases, we choose randomly among the newest N candidates.
     FORCE_FIRST_TOPIC_SOFT_FALLBACK = true
 
     # How far into the digest we'll look for a watched-category topic to consider for position 0
@@ -126,9 +125,6 @@ after_initialize do
 
     # ============================================================
     # NO-WATCHED-CATEGORIES SHUFFLE
-    #
-    # If the user has ZERO watched categories (watching / watching_first_post),
-    # optionally shuffle the first N topics of the digest list.
     # ============================================================
     SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES = true
     SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N      = 4
@@ -136,41 +132,26 @@ after_initialize do
 
     # ============================================================
     # PROMO PICK STRATEGY SWITCH
-    #
-    # "global": pick promo candidates from the whole forum (tagged topics), excluding digest ids.
-    #
-    # "prefer_digest_list":
-    #   1) FIRST try to satisfy replacement slots by SWAPPING IN eligible promo-tagged topics
-    #      that are ALREADY IN the digest list (no duplicates possible).
-    #   2) Only if not enough are available, FALLBACK to forum-wide candidates OUTSIDE the digest list
-    #      and replace the remaining slots (replacement, no insertion).
     # ============================================================
     PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
-
-    # Hard cap for how many candidate IDs we pull (then uniq/shuffle in Ruby)
     PROMO_CANDIDATE_SCAN_CAP = 500
 
     # ============================================================
-    # WATCHED-CATEGORY PERCENT ENFORCER (RUNS AFTER PROMO INJECTION, BEFORE FIRST-TOPIC LOGIC)
-    #
-    # Goal: ensure at least MIN% of topics in the final digest list are from watched categories.
-    # Strategy:
-    #   1) Try to REPLACE non-watched items with watched-category candidates found in a digest LOOKAHEAD window
-    #      (i.e., beyond the first :limit results from Topic.for_digest).
-    #   2) If still short, pull watched-category topics from the forum (visible+secured),
-    #      restricted to created_at > last_digest (when last_digest exists).
+    # WATCHED-CATEGORY PERCENT ENFORCER
     # ============================================================
     ENFORCE_MIN_WATCHED_CATEGORY_PERCENT = true
     MIN_WATCHED_CATEGORY_PERCENT         = 50 # 0..100
-
-    # How many extra items to look at from the digest relation beyond the main limit (step 1)
     WATCHED_ENFORCE_LOOKAHEAD_EXTRA      = 100
-
-    # Step 2: how many forum candidates to scan (newest first)
     WATCHED_ENFORCE_FORUM_SCAN_CAP       = 500
-  end
 
-  PLUGIN_NAME = "discourse-promo-digest-injector"
+    # ============================================================
+    # DEBUG HELPERS (NEW)
+    # ============================================================
+    # Keep callsite short to avoid huge payloads
+    DEBUG_CALLSITE_DEPTH = 10
+    # If true, include opts hash (sanitized) in payload debug
+    DEBUG_INCLUDE_OPTS = true
+  end
 
   # ============================================================
   # ASYNC JOB (NON-BLOCKING HTTP POST)
@@ -406,7 +387,7 @@ after_initialize do
         replaced_positions: [],
         replaced_out_ids: [],
         replaced_in_ids: [],
-        replaced_source: [] # "lookahead" or "forum"
+        replaced_source: []
       }
 
       return [ids, false, debug, watched_ids] if current_watched_count >= target_count
@@ -422,7 +403,6 @@ after_initialize do
       end
       return [ids, false, debug, watched_ids] if replace_positions.blank?
 
-      # Step 1: digest lookahead
       lookahead_extra = ::PromoDigestConfig::WATCHED_ENFORCE_LOOKAHEAD_EXTRA.to_i
       lookahead_extra = 0 if lookahead_extra < 0
 
@@ -475,7 +455,6 @@ after_initialize do
         end
       end
 
-      # Step 2: forum-wide watched categories, created_after_last_digest if known
       if need > 0 && replace_positions.present?
         scan_cap = ::PromoDigestConfig::WATCHED_ENFORCE_FORUM_SCAN_CAP.to_i
         scan_cap = 500 if scan_cap <= 0
@@ -533,6 +512,31 @@ after_initialize do
     end
 
     # ----------------------------
+    # DEBUG: sanitize opts (avoid heavy objects)
+    # ----------------------------
+    def self.sanitize_opts_for_debug(opts)
+      return nil unless ::PromoDigestConfig::DEBUG_INCLUDE_OPTS == true
+      return nil unless opts.is_a?(Hash)
+
+      out = {}
+      opts.each do |k, v|
+        key = k.to_s
+        case v
+        when String, Integer, Float, TrueClass, FalseClass, NilClass
+          out[key] = v
+        when Time
+          out[key] = v.utc.iso8601
+        else
+          # avoid big objects
+          out[key] = v.class.name
+        end
+      end
+      out
+    rescue
+      nil
+    end
+
+    # ----------------------------
     # Main hook
     # ----------------------------
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
@@ -556,6 +560,17 @@ after_initialize do
       tag_ids = tags.map(&:id).compact.uniq
 
       user_watched_category_ids = watched_category_ids_for_user(user)
+
+      # ---------- DEBUG CONTEXT (NEW) ----------
+      digest_build_uuid = Thread.current[:promo_digest_build_uuid]
+      for_digest_call_index = Thread.current[:promo_digest_for_digest_call_index]
+      for_digest_since = Thread.current[:promo_digest_since]
+      for_digest_opts_sanitized = Thread.current[:promo_digest_opts_sanitized]
+      for_digest_callsite = Thread.current[:promo_digest_callsite]
+
+      # A "dedupe key" field just for investigation (we do NOT dedupe in this build)
+      since_key = for_digest_since.respond_to?(:to_i) ? for_digest_since.to_i : 0
+      debug_dedupe_key = "u#{user.id}-s#{since_key}-l#{limit}"
 
       # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
       min_digests_required = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
@@ -810,7 +825,7 @@ after_initialize do
         end
 
       # ============================================================
-      # PERSIST FINAL DIGEST CONTENTS (your requirement)
+      # PERSIST FINAL DIGEST CONTENTS
       # ============================================================
       if final_ids.present?
         persist_last_digest_topics(user, final_ids)
@@ -868,7 +883,15 @@ after_initialize do
         no_watched_shuffle_coinflip_percent: no_watched_shuffle_coinflip_percent,
 
         watched_percent_enforcer_applied: watched_percent_enforcer_applied,
-        watched_percent_debug: watched_percent_debug
+        watched_percent_debug: watched_percent_debug,
+
+        # -------- DEBUG (NEW) --------
+        debug_digest_build_uuid: digest_build_uuid,
+        debug_for_digest_call_index: for_digest_call_index,
+        debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
+        debug_for_digest_opts: for_digest_opts_sanitized,
+        debug_for_digest_callsite: for_digest_callsite,
+        debug_dedupe_key: debug_dedupe_key
       )
 
       return original_relation if final_ids.blank?
@@ -1349,7 +1372,15 @@ after_initialize do
       no_watched_shuffle_coinflip_percent:,
 
       watched_percent_enforcer_applied:,
-      watched_percent_debug:
+      watched_percent_debug:,
+
+      # -------- DEBUG (NEW) --------
+      debug_digest_build_uuid:,
+      debug_for_digest_call_index:,
+      debug_for_digest_since:,
+      debug_for_digest_opts:,
+      debug_for_digest_callsite:,
+      debug_dedupe_key:
     )
       endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
       return if endpoint.empty?
@@ -1384,6 +1415,14 @@ after_initialize do
         final_topics: pack_topics(final_ids),
 
         debug: {
+          # ====== NEW DEBUG CORE ======
+          digest_build_uuid: debug_digest_build_uuid,
+          for_digest_call_index: debug_for_digest_call_index,
+          for_digest_since: debug_for_digest_since,
+          for_digest_opts: debug_for_digest_opts,
+          for_digest_callsite: debug_for_digest_callsite,
+          debug_dedupe_key: debug_dedupe_key,
+
           promo_tag_found: promo_tag_found,
           promo_tag_id: promo_tag_id,
           promo_tag_ids: promo_tag_ids,
@@ -1450,9 +1489,20 @@ after_initialize do
     end
   end
 
+  # ============================================================
+  # Wrapper: sets build UUID + resets call counter per digest build
+  # ============================================================
   module ::PromoDigestDigestWrapper
     def digest(user, opts = {})
       Thread.current[:promo_digest_in_digest] = true
+      Thread.current[:promo_digest_build_uuid] = SecureRandom.hex(8)
+      Thread.current[:promo_digest_for_digest_call_index] = 0
+
+      # clear per-build call context
+      Thread.current[:promo_digest_since] = nil
+      Thread.current[:promo_digest_opts_sanitized] = nil
+      Thread.current[:promo_digest_callsite] = nil
+
       super
     ensure
       Thread.current[:promo_digest_in_digest] = false
@@ -1460,8 +1510,24 @@ after_initialize do
   end
   ::UserNotifications.prepend ::PromoDigestDigestWrapper
 
+  # ============================================================
+  # Hook: captures since/opts/callsite for each Topic.for_digest call
+  # ============================================================
   module ::PromoDigestForDigestOverride
     def for_digest(user, since, opts = nil)
+      # Only track inside digest build
+      if Thread.current[:promo_digest_in_digest] == true
+        Thread.current[:promo_digest_for_digest_call_index] =
+          (Thread.current[:promo_digest_for_digest_call_index].to_i + 1)
+
+        Thread.current[:promo_digest_since] = since
+        Thread.current[:promo_digest_opts_sanitized] = ::PromoDigestInjector.sanitize_opts_for_debug(opts)
+
+        depth = ::PromoDigestConfig::DEBUG_CALLSITE_DEPTH.to_i
+        depth = 10 if depth <= 0
+        Thread.current[:promo_digest_callsite] = caller_locations(0, depth).map(&:to_s)
+      end
+
       rel = super(user, since, opts)
       ::PromoDigestInjector.maybe_adjust_digest_topics(user, rel, opts)
     end
