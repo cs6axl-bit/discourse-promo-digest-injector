@@ -112,7 +112,7 @@ after_initialize do
     # SUPERPROMO (INDEPENDENT SECOND PIPELINE)
     # Runs AFTER regular promo injection
     # ============================================================
-    SUPERPROMO_ENABLED = true
+    SUPERPROMO_ENABLED = false
 
     # Tag names on topics (case-insensitive) for superpromo pipeline
     SUPERPROMO_TAGS = ["trusted"]
