@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.3.8
+# version: 1.3.9
 # authors: you
 
 after_initialize do
@@ -107,6 +107,36 @@ after_initialize do
     MIN_WATCHED_CATEGORY_PERCENT         = 50 # 0..100
     WATCHED_ENFORCE_LOOKAHEAD_EXTRA      = 100
     WATCHED_ENFORCE_FORUM_SCAN_CAP       = 500
+
+    # ============================================================
+    # SUPERPROMO (INDEPENDENT SECOND PIPELINE)
+    # Runs AFTER regular promo injection
+    # ============================================================
+    SUPERPROMO_ENABLED = true
+
+    # Tag names on topics (case-insensitive) for superpromo pipeline
+    SUPERPROMO_TAGS = ["trusted"]
+
+    # If user is "watching" any categories, only pick superpromo-tagged topics from those categories.
+    SUPERPROMO_USE_WATCHED_CATEGORIES = true
+    SUPERPROMO_INCLUDE_WATCHING_FIRST_POST = true
+
+    # If ANY superpromo-tagged topic exists in positions 1..SUPERPROMO_MIN_POSITION => do nothing
+    SUPERPROMO_MIN_POSITION = 3
+
+    # If above condition fails: in this % of cases do nothing
+    SUPERPROMO_COINFLIP_SKIP_PERCENT = 30 # 0..100
+
+    # Otherwise: replace SUPERPROMO_REPLACE_COUNT topics within the top SUPERPROMO_REPLACE_WITHIN_TOP_N positions
+    SUPERPROMO_REPLACE_WITHIN_TOP_N = 3
+    SUPERPROMO_REPLACE_COUNT        = 1
+
+    # Superpromo pool recency gate:
+    SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST = true
+
+    # Pick strategy:
+    SUPERPROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
+    SUPERPROMO_CANDIDATE_SCAN_CAP = 500
 
     # ============================================================
     # DEBUG HELPERS
@@ -522,6 +552,17 @@ after_initialize do
       tags = promo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       tag_ids = tags.map(&:id).compact.uniq
 
+      # SUPERPROMO tags (independent pipeline)
+      superpromo_tags =
+        Array(::PromoDigestConfig::SUPERPROMO_TAGS)
+          .map { |t| t.to_s.strip.downcase }
+          .reject(&:empty?)
+          .uniq
+
+      superpromo_tag_for_payload = superpromo_tags.join(", ")
+      superpromo_tag_models = superpromo_tags.map { |t| find_tag_by_name_ci(t) }.compact
+      superpromo_tag_ids = superpromo_tag_models.map(&:id).compact.uniq
+
       user_watched_category_ids = watched_category_ids_for_user(user)
 
       # ---------- DEBUG CONTEXT ----------
@@ -618,6 +659,32 @@ after_initialize do
 
       watched_percent_enforcer_applied = false
       watched_percent_debug = {}
+
+      # -------- SUPERPROMO tracking vars --------
+      superpromo_has_tagged_in_top = false
+      superpromo_is_skipped_hastag = false
+      superpromo_is_skipped_coinflip = false
+      superpromo_attempted_replace = false
+      superpromo_replace_indices = []
+      superpromo_injected_ids = []
+
+      superpromo_candidate_pool_count = 0
+      superpromo_visible_pool_count = 0
+      superpromo_watched_category_ids = []
+      superpromo_watched_filter_applied = false
+
+      superpromo_pick_mode = ::PromoDigestConfig::SUPERPROMO_PICK_MODE.to_s.strip
+      superpromo_pick_mode = "global" if superpromo_pick_mode.empty?
+      superpromo_prefer_digest_list_mode = (superpromo_pick_mode == "prefer_digest_list")
+
+      superpromo_digest_list_candidates_count = 0
+      superpromo_digest_list_visible_count = 0
+      superpromo_digest_list_picked = []
+      superpromo_fallback_picked = []
+      superpromo_used_fallback_outside_digest = false
+
+      superpromo_created_after_enabled = (::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
+      superpromo_created_after_applied = (superpromo_created_after_enabled && last_digest_sent_at.present?)
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
@@ -724,7 +791,143 @@ after_initialize do
       end
 
       # ============================================================
-      # Enforce minimum % watched-category topics (AFTER promo, BEFORE first-topic logic)
+      # SUPERPROMO injection block (runs SECOND, independent)
+      # ============================================================
+      if ::PromoDigestConfig::SUPERPROMO_ENABLED == true && final_ids.present? && superpromo_tag_ids.present?
+        # Determine whether there is already a superpromo tag in top N (using superpromo watched settings)
+        superpromo_tagged_ids_set =
+          begin
+            w2 = watched_category_ids_for_user_superpromo(user)
+            if w2.present?
+              fetch_tagged_topic_ids_any_tag_in_categories(final_ids, superpromo_tag_ids, w2).to_set
+            else
+              fetch_tagged_topic_ids_any_tag(final_ids, superpromo_tag_ids).to_set
+            end
+          rescue
+            Set.new
+          end
+
+        superpromo_min_position = ::PromoDigestConfig::SUPERPROMO_MIN_POSITION.to_i
+        superpromo_min_position = 3 if superpromo_min_position <= 0
+
+        superpromo_has_tagged_in_top =
+          if final_ids.present?
+            final_ids.first(superpromo_min_position).any? { |tid| superpromo_tagged_ids_set.include?(tid) }
+          else
+            false
+          end
+
+        superpromo_is_skipped_hastag = superpromo_has_tagged_in_top
+
+        superpromo_skip_percent = ::PromoDigestConfig::SUPERPROMO_COINFLIP_SKIP_PERCENT.to_i
+        superpromo_skip_percent = 0 if superpromo_skip_percent < 0
+        superpromo_skip_percent = 100 if superpromo_skip_percent > 100
+
+        if !superpromo_is_skipped_hastag
+          if rand(100) < superpromo_skip_percent
+            superpromo_is_skipped_coinflip = true
+          else
+            within_top_n = ::PromoDigestConfig::SUPERPROMO_REPLACE_WITHIN_TOP_N.to_i
+            within_top_n = 3 if within_top_n <= 0
+
+            sp_replace_count = ::PromoDigestConfig::SUPERPROMO_REPLACE_COUNT.to_i
+            sp_replace_count = 1 if sp_replace_count <= 0
+
+            window = [within_top_n, final_ids.length].min
+            if window > 0 && sp_replace_count > 0
+              superpromo_attempted_replace = true
+              superpromo_replace_indices = (0...window).to_a.sample([sp_replace_count, window].min)
+
+              if superpromo_prefer_digest_list_mode
+                tmp_ids = final_ids.dup
+
+                eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
+                  eligible_superpromo_set_within_digest_list(
+                    user,
+                    tag_ids: superpromo_tag_ids,
+                    digest_ids: final_ids, # IMPORTANT: operate on post-promo list
+                    created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                  )
+
+                superpromo_digest_list_candidates_count = cand_ct
+                superpromo_digest_list_visible_count = vis_ct
+                superpromo_watched_category_ids = watched_ids
+                superpromo_watched_filter_applied = watched_applied
+
+                _satisfied, swapped_in_ids, remaining_indices =
+                  swap_eligible_promos_into_indices(
+                    tmp_ids,
+                    superpromo_replace_indices,
+                    eligible_set
+                  )
+
+                superpromo_digest_list_picked = swapped_in_ids.dup
+
+                if remaining_indices.any?
+                  remaining_need = remaining_indices.length
+
+                  fallback_ids, cand_b, vis_b, watched_b, watched_applied_b =
+                    pick_random_superpromo_topic_ids(
+                      user,
+                      tag_ids: superpromo_tag_ids,
+                      exclude_ids: tmp_ids,
+                      limit: remaining_need,
+                      created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                    )
+
+                  superpromo_used_fallback_outside_digest = fallback_ids.present?
+                  superpromo_fallback_picked = fallback_ids.dup
+
+                  superpromo_candidate_pool_count = cand_ct + cand_b
+                  superpromo_visible_pool_count = vis_ct + vis_b
+
+                  superpromo_watched_category_ids = watched_b
+                  superpromo_watched_filter_applied = watched_applied_b
+
+                  if fallback_ids.length == remaining_need
+                    remaining_indices.each_with_index do |idx, j|
+                      tmp_ids[idx] = fallback_ids[j]
+                    end
+
+                    final_ids = tmp_ids
+                    superpromo_injected_ids = swapped_in_ids + fallback_ids
+                  else
+                    superpromo_injected_ids = []
+                    superpromo_replace_indices = []
+                  end
+                else
+                  superpromo_candidate_pool_count = cand_ct
+                  superpromo_visible_pool_count = vis_ct
+                  final_ids = tmp_ids
+                  superpromo_injected_ids = swapped_in_ids
+                end
+              else
+                superpromo_injected_ids, superpromo_candidate_pool_count, superpromo_visible_pool_count,
+                  superpromo_watched_category_ids, superpromo_watched_filter_applied =
+                    pick_random_superpromo_topic_ids(
+                      user,
+                      tag_ids: superpromo_tag_ids,
+                      exclude_ids: final_ids,
+                      limit: superpromo_replace_indices.length,
+                      created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                    )
+
+                if superpromo_injected_ids.length == superpromo_replace_indices.length
+                  superpromo_replace_indices.each_with_index do |idx, j|
+                    final_ids[idx] = superpromo_injected_ids[j]
+                  end
+                else
+                  superpromo_injected_ids = []
+                  superpromo_replace_indices = []
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # ============================================================
+      # Enforce minimum % watched-category topics (AFTER promo+superpromo, BEFORE first-topic logic)
       # ============================================================
       begin
         final_ids, watched_percent_enforcer_applied, watched_percent_debug, _ =
@@ -847,6 +1050,27 @@ after_initialize do
         watched_percent_enforcer_applied: watched_percent_enforcer_applied,
         watched_percent_debug: watched_percent_debug,
 
+        # -------- SUPERPROMO DEBUG --------
+        superpromo_tag: superpromo_tag_for_payload,
+        superpromo_tag_ids: superpromo_tag_ids,
+        superpromo_injected_ids: superpromo_injected_ids,
+        superpromo_attempted_replace: superpromo_attempted_replace,
+        superpromo_replace_indices: superpromo_replace_indices,
+        superpromo_is_skipped_hastag: superpromo_is_skipped_hastag,
+        superpromo_is_skipped_coinflip: superpromo_is_skipped_coinflip,
+        superpromo_candidate_pool_count: superpromo_candidate_pool_count,
+        superpromo_visible_pool_count: superpromo_visible_pool_count,
+        superpromo_watched_category_ids: superpromo_watched_category_ids,
+        superpromo_watched_filter_applied: superpromo_watched_filter_applied,
+        superpromo_pick_mode: superpromo_pick_mode,
+        superpromo_digest_list_candidates_count: superpromo_digest_list_candidates_count,
+        superpromo_digest_list_visible_count: superpromo_digest_list_visible_count,
+        superpromo_digest_list_picked: superpromo_digest_list_picked,
+        superpromo_fallback_picked: superpromo_fallback_picked,
+        superpromo_used_fallback_outside_digest: superpromo_used_fallback_outside_digest,
+        superpromo_created_after_enabled: superpromo_created_after_enabled,
+        superpromo_created_after_applied: superpromo_created_after_applied,
+
         # -------- DEBUG --------
         debug_digest_build_uuid: digest_build_uuid,
         debug_for_digest_call_index: for_digest_call_index,
@@ -955,6 +1179,28 @@ after_initialize do
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    # SUPERPROMO watched categories (independent knobs)
+    def self.watched_category_ids_for_user_superpromo(user)
+      return [] unless ::PromoDigestConfig::SUPERPROMO_USE_WATCHED_CATEGORIES
+      return [] if user.nil?
+
+      levels = []
+      if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
+        nl = CategoryUser.notification_levels
+        levels << (nl[:watching] || 3)
+        if ::PromoDigestConfig::SUPERPROMO_INCLUDE_WATCHING_FIRST_POST
+          levels << (nl[:watching_first_post] || 4)
+        end
+      else
+        levels = ::PromoDigestConfig::SUPERPROMO_INCLUDE_WATCHING_FIRST_POST ? [3, 4] : [3]
+      end
+
+      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user_superpromo failed: #{e.class}: #{e.message}")
       []
     end
 
@@ -1129,6 +1375,52 @@ after_initialize do
     end
 
     # ============================================================
+    # Prefer-digest-list: eligible SUPERPROMO set inside digest list
+    # ============================================================
+    def self.eligible_superpromo_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
+      return [Set.new, 0, 0, [], false] if user.nil?
+      return [Set.new, 0, 0, [], false] if tag_ids.blank?
+      return [Set.new, 0, 0, [], false] if digest_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      watched_ids = watched_category_ids_for_user_superpromo(user)
+      watched_filter_applied = watched_ids.present?
+
+      scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_ids, topic_id: digest_ids })
+          .distinct
+
+      scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      if ::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+        scope = scope.where("topics.created_at > ?", created_after)
+      end
+
+      candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
+      candidate_pool_count = candidate_ids.length
+      return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
+
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .pluck(:id)
+          .map(&:to_i)
+
+      visible_pool_count = visible_ids.length
+      return [Set.new, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
+
+      [visible_ids.to_set, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] eligible_superpromo_set_within_digest_list failed: #{e.class}: #{e.message}")
+      [Set.new, 0, 0, [], false]
+    end
+
+    # ============================================================
     # Prefer-digest-list: swap eligible promos into target indices
     # ============================================================
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
@@ -1238,6 +1530,65 @@ after_initialize do
       [[], 0, 0, [], false]
     end
 
+    # ============================================================
+    # Global picker (forum-wide) SUPERPROMO
+    # ============================================================
+    def self.pick_random_superpromo_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
+      return [[], 0, 0, [], false] if limit.to_i <= 0
+      return [[], 0, 0, [], false] if tag_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      watched_ids = watched_category_ids_for_user_superpromo(user)
+      watched_filter_applied = watched_ids.present?
+
+      topic_tag_scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_ids })
+          .where.not(topic_tags: { topic_id: exclude_ids })
+          .distinct
+
+      topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      if ::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+        topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
+      end
+
+      scan_cap = ::PromoDigestConfig::SUPERPROMO_CANDIDATE_SCAN_CAP.to_i
+      scan_cap = 500 if scan_cap <= 0
+
+      candidate_ids =
+        topic_tag_scope
+          .limit(scan_cap)
+          .pluck("topic_tags.topic_id")
+          .map(&:to_i)
+          .uniq
+
+      candidate_pool_count = candidate_ids.length
+      return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
+
+      candidate_ids = candidate_ids.shuffle
+
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .where.not(id: exclude_ids)
+          .pluck(:id)
+          .map(&:to_i)
+
+      visible_pool_count = visible_ids.length
+      return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
+
+      picked = visible_ids.sample([limit.to_i, visible_ids.length].min)
+      [picked, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] pick_random_superpromo_topic_ids failed: #{e.class}: #{e.message}")
+      [[], 0, 0, [], false]
+    end
+
     def self.build_ordered_relation(user, ids)
       return Topic.none if ids.blank?
 
@@ -1334,6 +1685,27 @@ after_initialize do
       watched_percent_enforcer_applied:,
       watched_percent_debug:,
 
+      # -------- SUPERPROMO --------
+      superpromo_tag:,
+      superpromo_tag_ids:,
+      superpromo_injected_ids:,
+      superpromo_attempted_replace:,
+      superpromo_replace_indices:,
+      superpromo_is_skipped_hastag:,
+      superpromo_is_skipped_coinflip:,
+      superpromo_candidate_pool_count:,
+      superpromo_visible_pool_count:,
+      superpromo_watched_category_ids:,
+      superpromo_watched_filter_applied:,
+      superpromo_pick_mode:,
+      superpromo_digest_list_candidates_count:,
+      superpromo_digest_list_visible_count:,
+      superpromo_digest_list_picked:,
+      superpromo_fallback_picked:,
+      superpromo_used_fallback_outside_digest:,
+      superpromo_created_after_enabled:,
+      superpromo_created_after_applied:,
+
       debug_digest_build_uuid:,
       debug_for_digest_call_index:,
       debug_for_digest_since:,
@@ -1429,7 +1801,32 @@ after_initialize do
           fallback_picked: fallback_picked,
 
           injected_topic_ids: injected_ids,
-          replaced_indices: replaced_indices
+          replaced_indices: replaced_indices,
+
+          # -------- SUPERPROMO --------
+          superpromo: {
+            enabled: ::PromoDigestConfig::SUPERPROMO_ENABLED,
+            tag: superpromo_tag,
+            tag_ids: superpromo_tag_ids,
+            injected_topic_ids: superpromo_injected_ids,
+            attempted_replace: superpromo_attempted_replace,
+            replaced_indices: superpromo_replace_indices,
+            is_skipped_hastag: superpromo_is_skipped_hastag,
+            is_skipped_coinflip: superpromo_is_skipped_coinflip,
+            candidate_pool_count: superpromo_candidate_pool_count,
+            visible_pool_count: superpromo_visible_pool_count,
+            watched_category_ids: superpromo_watched_category_ids,
+            watched_categories_mode: ::PromoDigestConfig::SUPERPROMO_USE_WATCHED_CATEGORIES,
+            watched_filter_applied: superpromo_watched_filter_applied,
+            pick_mode: superpromo_pick_mode,
+            digest_list_candidates_count: superpromo_digest_list_candidates_count,
+            digest_list_visible_count: superpromo_digest_list_visible_count,
+            digest_list_picked: superpromo_digest_list_picked,
+            used_fallback_outside_digest: superpromo_used_fallback_outside_digest,
+            fallback_picked: superpromo_fallback_picked,
+            created_after_last_digest_filter_enabled: superpromo_created_after_enabled,
+            created_after_last_digest_filter_applied: superpromo_created_after_applied
+          }
         }
       }
 
