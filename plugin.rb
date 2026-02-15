@@ -793,7 +793,11 @@ after_initialize do
       # ============================================================
       # SUPERPROMO injection block (runs SECOND, independent)
       # ============================================================
-      if ::PromoDigestConfig::SUPERPROMO_ENABLED == true && final_ids.present? && superpromo_tag_ids.present?
+   if ::PromoDigestConfig::SUPERPROMO_ENABLED == true &&
+   !is_skipped_min_digests &&
+   final_ids.present? &&
+   superpromo_tag_ids.present?
+
         # Determine whether there is already a superpromo tag in top N (using superpromo watched settings)
         superpromo_tagged_ids_set =
           begin
