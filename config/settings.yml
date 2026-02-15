@@ -1,22 +1,40 @@
+# config/settings.yml
+
 plugins:
+  # =========================
+  # MASTER SWITCHES
+  # =========================
   promo_digest_injector_enabled:
     default: true
     client: false
 
+  # NEW: disables ONLY the "regular promo" injection block (superpromo still runs)
+  promo_digest_injector_regular_enabled:
+    default: true
+    client: false
+
+  # =========================
+  # MIN-DIGESTS GATE
+  # =========================
   promo_digest_injector_min_digests_before_inject:
-    default: 3
+    default: 0
+    min: 0
+    max: 999999
     client: false
 
   promo_digest_injector_digest_count_custom_field:
     default: "digest_sent_counter"
     client: false
 
+  # =========================
+  # REGULAR PROMO (tags + injection)
+  # =========================
   promo_digest_injector_promo_tags:
-    default: "helpful|useful"
+    default: "promo"
     client: false
 
   promo_digest_injector_use_watched_categories:
-    default: true
+    default: false
     client: false
 
   promo_digest_injector_include_watching_first_post:
@@ -25,142 +43,62 @@ plugins:
 
   promo_digest_injector_min_position:
     default: 3
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_coinflip_skip_percent:
-    default: 30
+    default: 0
+    min: 0
+    max: 100
     client: false
 
   promo_digest_injector_replace_within_top_n:
     default: 3
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_replace_count:
     default: 1
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_default_digest_limit:
     default: 50
-    client: false
-
-  promo_digest_injector_endpoint_url:
-    default: "http://172.17.0.1:8081/digest_inject.php"
-    client: false
-
-  promo_digest_injector_secret_header_value:
-    default: ""
-    client: false
-
-  promo_digest_injector_log_post_results:
-    default: false
-    client: false
-
-  promo_digest_injector_http_open_timeout:
-    default: 3
-    client: false
-
-  promo_digest_injector_http_read_timeout:
-    default: 5
-    client: false
-
-  promo_digest_injector_send_ids_only:
-    default: true
-    client: false
-
-  promo_digest_injector_last_digest_topics_field:
-    default: "promo_digest_last50_topic_ids"
-    client: false
-
-  promo_digest_injector_last_digest_topics_max:
-    default: 50
-    client: false
-
-  promo_digest_injector_last_digest_first_topics_field:
-    default: "promo_digest_last10_first_topic_ids"
-    client: false
-
-  promo_digest_injector_last_digest_first_topics_max:
-    default: 10
-    client: false
-
-  promo_digest_injector_force_first_topic_from_watched_category:
-    default: true
-    client: false
-
-  promo_digest_injector_force_first_topic_watched_coinflip_percent:
-    default: 100
-    client: false
-
-  promo_digest_injector_force_first_topic_randomize_even_if_already_watched:
-    default: true
-    client: false
-
-  promo_digest_injector_force_first_topic_random_top_n:
-    default: 5
-    client: false
-
-  promo_digest_injector_force_first_topic_require_created_after_last_digest:
-    default: true
-    client: false
-
-  promo_digest_injector_force_first_topic_soft_fallback:
-    default: true
-    client: false
-
-  promo_digest_injector_force_first_topic_lookahead:
-    default: 50
+    min: 1
+    max: 200
     client: false
 
   promo_digest_injector_filter_promo_topics_created_after_last_digest:
-    default: true
+    default: false
     client: false
 
-  promo_digest_injector_shuffle_topics_if_no_watched_categories:
-    default: true
-    client: false
-
-  promo_digest_injector_shuffle_topics_if_no_watched_top_n:
-    default: 4
-    client: false
-
-  promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent:
-    default: 100
-    client: false
-
+  # "prefer_digest_list" or anything else (treated as "global_random" by your ruby)
   promo_digest_injector_promo_pick_mode:
     default: "prefer_digest_list"
     client: false
 
   promo_digest_injector_promo_candidate_scan_cap:
     default: 500
+    min: 1
+    max: 50000
     client: false
 
-  promo_digest_injector_enforce_min_watched_category_percent:
-    default: true
-    client: false
-
-  promo_digest_injector_min_watched_category_percent:
-    default: 50
-    client: false
-
-  promo_digest_injector_watched_enforce_lookahead_extra:
-    default: 100
-    client: false
-
-  promo_digest_injector_watched_enforce_forum_scan_cap:
-    default: 500
-    client: false
-
+  # =========================
+  # SUPERPROMO (independent pipeline)
+  # =========================
   promo_digest_injector_superpromo_enabled:
     default: false
     client: false
 
   promo_digest_injector_superpromo_tags:
-    default: "trusted"
+    default: "superpromo"
     client: false
 
   promo_digest_injector_superpromo_use_watched_categories:
-    default: true
+    default: false
     client: false
 
   promo_digest_injector_superpromo_include_watching_first_post:
@@ -169,22 +107,30 @@ plugins:
 
   promo_digest_injector_superpromo_min_position:
     default: 3
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_superpromo_coinflip_skip_percent:
-    default: 30
+    default: 0
+    min: 0
+    max: 100
     client: false
 
   promo_digest_injector_superpromo_replace_within_top_n:
     default: 3
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_superpromo_replace_count:
     default: 1
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_superpromo_filter_topics_created_after_last_digest:
-    default: true
+    default: false
     client: false
 
   promo_digest_injector_superpromo_pick_mode:
@@ -193,10 +139,154 @@ plugins:
 
   promo_digest_injector_superpromo_candidate_scan_cap:
     default: 500
+    min: 1
+    max: 50000
     client: false
 
+  # =========================
+  # WATCHED-CATEGORY PERCENT ENFORCER
+  # =========================
+  promo_digest_injector_enforce_min_watched_category_percent:
+    default: false
+    client: false
+
+  promo_digest_injector_min_watched_category_percent:
+    default: 0
+    min: 0
+    max: 100
+    client: false
+
+  promo_digest_injector_watched_enforce_lookahead_extra:
+    default: 0
+    min: 0
+    max: 500
+    client: false
+
+  promo_digest_injector_watched_enforce_forum_scan_cap:
+    default: 500
+    min: 1
+    max: 50000
+    client: false
+
+  # =========================
+  # FORCE FIRST TOPIC FROM WATCHED CATEGORY
+  # =========================
+  promo_digest_injector_force_first_topic_from_watched_category:
+    default: false
+    client: false
+
+  promo_digest_injector_force_first_topic_watched_coinflip_percent:
+    default: 100
+    min: 0
+    max: 100
+    client: false
+
+  promo_digest_injector_force_first_topic_randomize_even_if_already_watched:
+    default: false
+    client: false
+
+  promo_digest_injector_force_first_topic_random_top_n:
+    default: 5
+    min: 1
+    max: 100
+    client: false
+
+  promo_digest_injector_force_first_topic_require_created_after_last_digest:
+    default: false
+    client: false
+
+  promo_digest_injector_force_first_topic_soft_fallback:
+    default: true
+    client: false
+
+  promo_digest_injector_force_first_topic_lookahead:
+    default: 50
+    min: 1
+    max: 500
+    client: false
+
+  # =========================
+  # SHUFFLE TOPICS IF USER HAS NO WATCHED CATEGORIES
+  # NOTE: key name MUST match your ruby:
+  # SiteSetting.promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent
+  # =========================
+  promo_digest_injector_shuffle_topics_if_no_watched_categories:
+    default: false
+    client: false
+
+  promo_digest_injector_shuffle_topics_if_no_watched_top_n:
+    default: 4
+    min: 2
+    max: 50
+    client: false
+
+  promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent:
+    default: 0
+    min: 0
+    max: 100
+    client: false
+
+  # =========================
+  # PERSIST “LAST DIGEST TOPICS” FIELDS
+  # =========================
+  promo_digest_injector_last_digest_topics_field:
+    default: "promo_digest_last50_topic_ids"
+    client: false
+
+  promo_digest_injector_last_digest_topics_max:
+    default: 50
+    min: 1
+    max: 500
+    client: false
+
+  promo_digest_injector_last_digest_first_topics_field:
+    default: "promo_digest_last10_first_topic_ids"
+    client: false
+
+  promo_digest_injector_last_digest_first_topics_max:
+    default: 10
+    min: 1
+    max: 100
+    client: false
+
+  # =========================
+  # REPORT POSTBACK (PHP endpoint)
+  # =========================
+  promo_digest_injector_endpoint_url:
+    default: ""
+    client: false
+
+  promo_digest_injector_secret_header_value:
+    default: ""
+    client: false
+
+  promo_digest_injector_log_post_results:
+    default: true
+    client: false
+
+  promo_digest_injector_http_open_timeout:
+    default: 3
+    min: 1
+    max: 60
+    client: false
+
+  promo_digest_injector_http_read_timeout:
+    default: 5
+    min: 1
+    max: 120
+    client: false
+
+  promo_digest_injector_send_ids_only:
+    default: true
+    client: false
+
+  # =========================
+  # DEBUG
+  # =========================
   promo_digest_injector_debug_callsite_depth:
     default: 10
+    min: 1
+    max: 50
     client: false
 
   promo_digest_injector_debug_include_opts:
