@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.3.9
+# version: 1.4.0
 # authors: you
 
 after_initialize do
@@ -15,134 +15,257 @@ after_initialize do
   PLUGIN_NAME = "discourse-promo-digest-injector"
 
   # ============================================================
-  # CONFIG (EDIT HERE)
+  # SETTINGS HELPERS
   # ============================================================
-  module ::PromoDigestConfig
-    ENABLED = true
+  module ::PromoDigestSettings
+    def self.enabled?
+      SiteSetting.promo_digest_injector_enabled == true
+    end
 
-    # Don't activate promo insertion logic until user has received at least this many digests
-    MIN_DIGESTS_BEFORE_INJECT = 3
+    def self.min_digests_before_inject
+      v = SiteSetting.promo_digest_injector_min_digests_before_inject.to_i
+      v < 0 ? 0 : v
+    end
 
-    # If you run the digest counter plugin, it stores digest count here (fast path):
-    DIGEST_COUNT_CUSTOM_FIELD = "digest_sent_counter"
+    def self.digest_count_custom_field
+      SiteSetting.promo_digest_injector_digest_count_custom_field.to_s.strip
+    end
 
-    # PROMO SOURCE: Tag names on topics (case-insensitive)
-    PROMO_TAGS = ["helpful", "useful"]
+    def self.promo_tags
+      raw = SiteSetting.promo_digest_injector_promo_tags.to_s
+      raw.split("|").map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+    end
 
-    # If user is "watching" any categories, only pick promo-tagged topics from those categories.
-    USE_WATCHED_CATEGORIES = true
-    INCLUDE_WATCHING_FIRST_POST = true # treat "watching first post" as watched too
+    def self.use_watched_categories?
+      SiteSetting.promo_digest_injector_use_watched_categories == true
+    end
 
-    # If ANY promo-tagged topic exists in positions 1..MIN_POSITION => do nothing
-    # UPDATED: if user watches categories, this check uses (tag AND watched category) else tag-only.
-    MIN_POSITION = 3
+    def self.include_watching_first_post?
+      SiteSetting.promo_digest_injector_include_watching_first_post == true
+    end
 
-    # If above condition fails: in this % of cases do nothing
-    COINFLIP_SKIP_PERCENT = 30 # 0..100
+    def self.min_position
+      v = SiteSetting.promo_digest_injector_min_position.to_i
+      v <= 0 ? 3 : v
+    end
 
-    # Otherwise: replace REPLACE_COUNT topics within the top REPLACE_WITHIN_TOP_N digest positions
-    REPLACE_WITHIN_TOP_N = 3
-    REPLACE_COUNT        = 1
+    def self.coinflip_skip_percent
+      v = SiteSetting.promo_digest_injector_coinflip_skip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
 
-    # Digest list limit (Discourse passes opts[:limit], but we keep a safe default)
-    DEFAULT_DIGEST_LIMIT = 50
+    def self.replace_within_top_n
+      v = SiteSetting.promo_digest_injector_replace_within_top_n.to_i
+      v <= 0 ? 3 : v
+    end
 
-    # External summary endpoint (set empty to disable posting)
-    ENDPOINT_URL = "http://172.17.0.1:8081/digest_inject.php"
+    def self.replace_count
+      v = SiteSetting.promo_digest_injector_replace_count.to_i
+      v <= 0 ? 1 : v
+    end
 
-    # Optional secret header (leave empty to disable)
-    SECRET_HEADER_VALUE = "" # sent as X-Promo-Postback-Secret
+    def self.default_digest_limit
+      v = SiteSetting.promo_digest_injector_default_digest_limit.to_i
+      v <= 0 ? 50 : v
+    end
 
-    # Log the HTTP status code for the summary POST (in Sidekiq job logs)
-    LOG_POST_RESULTS = false
+    def self.endpoint_url
+      SiteSetting.promo_digest_injector_endpoint_url.to_s.strip
+    end
 
-    # HTTP timeouts (seconds) - used in Sidekiq job
-    HTTP_OPEN_TIMEOUT = 3
-    HTTP_READ_TIMEOUT = 5
+    def self.secret_header_value
+      SiteSetting.promo_digest_injector_secret_header_value.to_s
+    end
 
-    # IMPORTANT: Sidekiq job args should not be huge. This keeps payload smaller.
-    # Set false to send full topic objects (title/slug/url). Set true to send IDs only.
-    SEND_IDS_ONLY = true
+    def self.log_post_results?
+      SiteSetting.promo_digest_injector_log_post_results == true
+    end
 
-    # ============================================================
-    # PERSISTED HISTORY (FINAL DIGEST CONTENTS)
-    # ============================================================
-    LAST_DIGEST_TOPICS_FIELD = "promo_digest_last50_topic_ids" # JSON array of ints (string)
-    LAST_DIGEST_TOPICS_MAX   = 50
+    def self.http_open_timeout
+      v = SiteSetting.promo_digest_injector_http_open_timeout.to_i
+      v <= 0 ? 3 : v
+    end
 
-    LAST_DIGEST_FIRST_TOPICS_FIELD = "promo_digest_last10_first_topic_ids" # JSON array of ints (string)
-    LAST_DIGEST_FIRST_TOPICS_MAX   = 10
+    def self.http_read_timeout
+      v = SiteSetting.promo_digest_injector_http_read_timeout.to_i
+      v <= 0 ? 5 : v
+    end
 
-    # ============================================================
-    # Force first topic logic
-    # ============================================================
-    FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY = true
-    FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT = 100 # 0..100
-    FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED = true
-    FORCE_FIRST_TOPIC_RANDOM_TOP_N = 5
-    FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST = true
-    FORCE_FIRST_TOPIC_SOFT_FALLBACK = true
-    FORCE_FIRST_TOPIC_LOOKAHEAD = 50
+    def self.send_ids_only?
+      SiteSetting.promo_digest_injector_send_ids_only == true
+    end
 
-    # Promo pool recency gate:
-    FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST = true
+    def self.last_digest_topics_field
+      SiteSetting.promo_digest_injector_last_digest_topics_field.to_s.strip
+    end
 
-    # ============================================================
-    # NO-WATCHED-CATEGORIES SHUFFLE
-    # ============================================================
-    SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES = true
-    SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N      = 4
-    SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT = 100 # 0..100
+    def self.last_digest_topics_max
+      v = SiteSetting.promo_digest_injector_last_digest_topics_max.to_i
+      v <= 0 ? 50 : v
+    end
 
-    # ============================================================
-    # PROMO PICK STRATEGY SWITCH
-    # ============================================================
-    PROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
-    PROMO_CANDIDATE_SCAN_CAP = 500
+    def self.last_digest_first_topics_field
+      SiteSetting.promo_digest_injector_last_digest_first_topics_field.to_s.strip
+    end
 
-    # ============================================================
-    # WATCHED-CATEGORY PERCENT ENFORCER
-    # ============================================================
-    ENFORCE_MIN_WATCHED_CATEGORY_PERCENT = true
-    MIN_WATCHED_CATEGORY_PERCENT         = 50 # 0..100
-    WATCHED_ENFORCE_LOOKAHEAD_EXTRA      = 100
-    WATCHED_ENFORCE_FORUM_SCAN_CAP       = 500
+    def self.last_digest_first_topics_max
+      v = SiteSetting.promo_digest_injector_last_digest_first_topics_max.to_i
+      v <= 0 ? 10 : v
+    end
 
-    # ============================================================
-    # SUPERPROMO (INDEPENDENT SECOND PIPELINE)
-    # Runs AFTER regular promo injection
-    # ============================================================
-    SUPERPROMO_ENABLED = false
+    def self.force_first_topic_from_watched_category?
+      SiteSetting.promo_digest_injector_force_first_topic_from_watched_category == true
+    end
 
-    # Tag names on topics (case-insensitive) for superpromo pipeline
-    SUPERPROMO_TAGS = ["trusted"]
+    def self.force_first_topic_watched_coinflip_percent
+      v = SiteSetting.promo_digest_injector_force_first_topic_watched_coinflip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
 
-    # If user is "watching" any categories, only pick superpromo-tagged topics from those categories.
-    SUPERPROMO_USE_WATCHED_CATEGORIES = true
-    SUPERPROMO_INCLUDE_WATCHING_FIRST_POST = true
+    def self.force_first_topic_randomize_even_if_already_watched?
+      SiteSetting.promo_digest_injector_force_first_topic_randomize_even_if_already_watched == true
+    end
 
-    # If ANY superpromo-tagged topic exists in positions 1..SUPERPROMO_MIN_POSITION => do nothing
-    SUPERPROMO_MIN_POSITION = 3
+    def self.force_first_topic_random_top_n
+      v = SiteSetting.promo_digest_injector_force_first_topic_random_top_n.to_i
+      v <= 0 ? 5 : v
+    end
 
-    # If above condition fails: in this % of cases do nothing
-    SUPERPROMO_COINFLIP_SKIP_PERCENT = 30 # 0..100
+    def self.force_first_topic_require_created_after_last_digest?
+      SiteSetting.promo_digest_injector_force_first_topic_require_created_after_last_digest == true
+    end
 
-    # Otherwise: replace SUPERPROMO_REPLACE_COUNT topics within the top SUPERPROMO_REPLACE_WITHIN_TOP_N positions
-    SUPERPROMO_REPLACE_WITHIN_TOP_N = 3
-    SUPERPROMO_REPLACE_COUNT        = 1
+    def self.force_first_topic_soft_fallback?
+      SiteSetting.promo_digest_injector_force_first_topic_soft_fallback == true
+    end
 
-    # Superpromo pool recency gate:
-    SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST = true
+    def self.force_first_topic_lookahead
+      v = SiteSetting.promo_digest_injector_force_first_topic_lookahead.to_i
+      v <= 0 ? 50 : v
+    end
 
-    # Pick strategy:
-    SUPERPROMO_PICK_MODE = "prefer_digest_list" # "global" or "prefer_digest_list"
-    SUPERPROMO_CANDIDATE_SCAN_CAP = 500
+    def self.filter_promo_topics_created_after_last_digest?
+      SiteSetting.promo_digest_injector_filter_promo_topics_created_after_last_digest == true
+    end
 
-    # ============================================================
-    # DEBUG HELPERS
-    # ============================================================
-    DEBUG_CALLSITE_DEPTH = 10
-    DEBUG_INCLUDE_OPTS = true
+    def self.shuffle_topics_if_no_watched_categories?
+      SiteSetting.promo_digest_injector_shuffle_topics_if_no_watched_categories == true
+    end
+
+    def self.shuffle_topics_if_no_watched_top_n
+      v = SiteSetting.promo_digest_injector_shuffle_topics_if_no_watched_top_n.to_i
+      v <= 0 ? 4 : v
+    end
+
+    def self.shuffle_topics_if_no_watched_coinflip_percent
+      v = SiteSetting.promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
+
+    def self.promo_pick_mode
+      m = SiteSetting.promo_digest_injector_promo_pick_mode.to_s.strip
+      m = "prefer_digest_list" if m.empty?
+      m
+    end
+
+    def self.promo_candidate_scan_cap
+      v = SiteSetting.promo_digest_injector_promo_candidate_scan_cap.to_i
+      v <= 0 ? 500 : v
+    end
+
+    def self.enforce_min_watched_category_percent?
+      SiteSetting.promo_digest_injector_enforce_min_watched_category_percent == true
+    end
+
+    def self.min_watched_category_percent
+      v = SiteSetting.promo_digest_injector_min_watched_category_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
+
+    def self.watched_enforce_lookahead_extra
+      v = SiteSetting.promo_digest_injector_watched_enforce_lookahead_extra.to_i
+      v < 0 ? 0 : v
+    end
+
+    def self.watched_enforce_forum_scan_cap
+      v = SiteSetting.promo_digest_injector_watched_enforce_forum_scan_cap.to_i
+      v <= 0 ? 500 : v
+    end
+
+    # -------- SUPERPROMO --------
+    def self.superpromo_enabled?
+      SiteSetting.promo_digest_injector_superpromo_enabled == true
+    end
+
+    def self.superpromo_tags
+      raw = SiteSetting.promo_digest_injector_superpromo_tags.to_s
+      raw.split("|").map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+    end
+
+    def self.superpromo_use_watched_categories?
+      SiteSetting.promo_digest_injector_superpromo_use_watched_categories == true
+    end
+
+    def self.superpromo_include_watching_first_post?
+      SiteSetting.promo_digest_injector_superpromo_include_watching_first_post == true
+    end
+
+    def self.superpromo_min_position
+      v = SiteSetting.promo_digest_injector_superpromo_min_position.to_i
+      v <= 0 ? 3 : v
+    end
+
+    def self.superpromo_coinflip_skip_percent
+      v = SiteSetting.promo_digest_injector_superpromo_coinflip_skip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
+
+    def self.superpromo_replace_within_top_n
+      v = SiteSetting.promo_digest_injector_superpromo_replace_within_top_n.to_i
+      v <= 0 ? 3 : v
+      v
+    end
+
+    def self.superpromo_replace_count
+      v = SiteSetting.promo_digest_injector_superpromo_replace_count.to_i
+      v <= 0 ? 1 : v
+      v
+    end
+
+    def self.superpromo_filter_topics_created_after_last_digest?
+      SiteSetting.promo_digest_injector_superpromo_filter_topics_created_after_last_digest == true
+    end
+
+    def self.superpromo_pick_mode
+      m = SiteSetting.promo_digest_injector_superpromo_pick_mode.to_s.strip
+      m = "prefer_digest_list" if m.empty?
+      m
+    end
+
+    def self.superpromo_candidate_scan_cap
+      v = SiteSetting.promo_digest_injector_superpromo_candidate_scan_cap.to_i
+      v <= 0 ? 500 : v
+    end
+
+    # -------- DEBUG --------
+    def self.debug_callsite_depth
+      v = SiteSetting.promo_digest_injector_debug_callsite_depth.to_i
+      v <= 0 ? 10 : v
+    end
+
+    def self.debug_include_opts?
+      SiteSetting.promo_digest_injector_debug_include_opts == true
+    end
   end
 
   # ============================================================
@@ -187,14 +310,13 @@ after_initialize do
     def self.user_digest_count(user)
       return 0 if user.nil?
 
-      cf_key = ::PromoDigestConfig::DIGEST_COUNT_CUSTOM_FIELD.to_s.strip
+      cf_key = ::PromoDigestSettings.digest_count_custom_field
       if cf_key != ""
         cf_val = user.custom_fields[cf_key]
         return cf_val.to_i if cf_val.present?
       end
 
-      min_needed = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
-      min_needed = 0 if min_needed < 0
+      min_needed = ::PromoDigestSettings.min_digests_before_inject
       return 0 if min_needed <= 0
 
       EmailLog.where(user_id: user.id, email_type: "digest").limit(min_needed).count
@@ -229,16 +351,15 @@ after_initialize do
     end
 
     # ----------------------------
-    # Store last 50 FINAL digest topics (newest first, duplicates allowed)
+    # Store last N FINAL digest topics (newest first, duplicates allowed)
     # ----------------------------
     def self.persist_last_digest_topics(user, topic_ids)
       return if user.nil?
 
-      field = ::PromoDigestConfig::LAST_DIGEST_TOPICS_FIELD.to_s
+      field = ::PromoDigestSettings.last_digest_topics_field
       return if field.strip.empty?
 
-      max_n = ::PromoDigestConfig::LAST_DIGEST_TOPICS_MAX.to_i
-      max_n = 50 if max_n <= 0
+      max_n = ::PromoDigestSettings.last_digest_topics_max
 
       current = Array(topic_ids).map(&:to_i).reject(&:zero?)
       return if current.empty?
@@ -267,16 +388,15 @@ after_initialize do
     end
 
     # ----------------------------
-    # Store last 10 FINAL position-0 topic ids (newest first, duplicates allowed)
+    # Store last N FINAL position-0 topic ids (newest first, duplicates allowed)
     # ----------------------------
     def self.persist_last_digest_first_topic(user, first_topic_id)
       return if user.nil?
 
-      field = ::PromoDigestConfig::LAST_DIGEST_FIRST_TOPICS_FIELD.to_s
+      field = ::PromoDigestSettings.last_digest_first_topics_field
       return if field.strip.empty?
 
-      max_n = ::PromoDigestConfig::LAST_DIGEST_FIRST_TOPICS_MAX.to_i
-      max_n = 10 if max_n <= 0
+      max_n = ::PromoDigestSettings.last_digest_first_topics_max
 
       tid = first_topic_id.to_i
       return if tid <= 0
@@ -344,14 +464,12 @@ after_initialize do
     def self.enforce_min_watched_category_percent(user, ids, base_relation, limit:, last_digest_sent_at:)
       return [ids, false, {}, []] if user.nil?
       return [ids, false, {}, []] if ids.blank?
-      return [ids, false, {}, []] unless ::PromoDigestConfig::ENFORCE_MIN_WATCHED_CATEGORY_PERCENT == true
+      return [ids, false, {}, []] unless ::PromoDigestSettings.enforce_min_watched_category_percent?
 
       watched_ids = watched_category_ids_for_user(user)
       return [ids, false, {}, watched_ids] if watched_ids.blank?
 
-      pct = ::PromoDigestConfig::MIN_WATCHED_CATEGORY_PERCENT.to_i
-      pct = 0 if pct < 0
-      pct = 100 if pct > 100
+      pct = ::PromoDigestSettings.min_watched_category_percent
       return [ids, false, {}, watched_ids] if pct <= 0
 
       guardian = Guardian.new(user)
@@ -396,8 +514,7 @@ after_initialize do
       return [ids, false, debug, watched_ids] if replace_positions.blank?
 
       # Step 1: digest lookahead
-      lookahead_extra = ::PromoDigestConfig::WATCHED_ENFORCE_LOOKAHEAD_EXTRA.to_i
-      lookahead_extra = 0 if lookahead_extra < 0
+      lookahead_extra = ::PromoDigestSettings.watched_enforce_lookahead_extra
 
       if lookahead_extra > 0 && base_relation.present?
         extra_ids =
@@ -450,8 +567,7 @@ after_initialize do
 
       # Step 2: forum-wide watched categories, created_after_last_digest if known
       if need > 0 && replace_positions.present?
-        scan_cap = ::PromoDigestConfig::WATCHED_ENFORCE_FORUM_SCAN_CAP.to_i
-        scan_cap = 500 if scan_cap <= 0
+        scan_cap = ::PromoDigestSettings.watched_enforce_forum_scan_cap
 
         scope =
           Topic
@@ -509,7 +625,7 @@ after_initialize do
     # DEBUG: sanitize opts
     # ----------------------------
     def self.sanitize_opts_for_debug(opts)
-      return nil unless ::PromoDigestConfig::DEBUG_INCLUDE_OPTS == true
+      return nil unless ::PromoDigestSettings.debug_include_opts?
       return nil unless opts.is_a?(Hash)
 
       out = {}
@@ -533,7 +649,7 @@ after_initialize do
     # Main hook
     # ----------------------------
     def self.maybe_adjust_digest_topics(user, original_relation, opts)
-      return original_relation unless ::PromoDigestConfig::ENABLED
+      return original_relation unless ::PromoDigestSettings.enabled?
       return original_relation unless Thread.current[:promo_digest_in_digest] == true
       return original_relation if user.nil?
 
@@ -541,24 +657,14 @@ after_initialize do
       original_ids = original_relation.limit(limit).pluck(:id)
       original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
 
-      promo_tags =
-        Array(::PromoDigestConfig::PROMO_TAGS)
-          .map { |t| t.to_s.strip.downcase }
-          .reject(&:empty?)
-          .uniq
-
+      promo_tags = ::PromoDigestSettings.promo_tags
       promo_tag_for_payload = promo_tags.join(", ")
 
       tags = promo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       tag_ids = tags.map(&:id).compact.uniq
 
       # SUPERPROMO tags (independent pipeline)
-      superpromo_tags =
-        Array(::PromoDigestConfig::SUPERPROMO_TAGS)
-          .map { |t| t.to_s.strip.downcase }
-          .reject(&:empty?)
-          .uniq
-
+      superpromo_tags = ::PromoDigestSettings.superpromo_tags
       superpromo_tag_for_payload = superpromo_tags.join(", ")
       superpromo_tag_models = superpromo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       superpromo_tag_ids = superpromo_tag_models.map(&:id).compact.uniq
@@ -576,8 +682,7 @@ after_initialize do
       debug_dedupe_key = "u#{user.id}-s#{since_key}-l#{limit}"
 
       # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
-      min_digests_required = ::PromoDigestConfig::MIN_DIGESTS_BEFORE_INJECT.to_i
-      min_digests_required = 0 if min_digests_required < 0
+      min_digests_required = ::PromoDigestSettings.min_digests_before_inject
 
       user_digest_count_val = 0
       is_skipped_min_digests = false
@@ -607,8 +712,7 @@ after_initialize do
       original_topics_matched_tags =
         matched_promo_tag_names_by_topic(tagged_ids_in_original, promo_tags)
 
-      min_position = ::PromoDigestConfig::MIN_POSITION.to_i
-      min_position = 3 if min_position <= 0
+      min_position = ::PromoDigestSettings.min_position
 
       has_tagged_in_top =
         if original_ids.present?
@@ -617,9 +721,7 @@ after_initialize do
           false
         end
 
-      skip_percent = ::PromoDigestConfig::COINFLIP_SKIP_PERCENT.to_i
-      skip_percent = 0 if skip_percent < 0
-      skip_percent = 100 if skip_percent > 100
+      skip_percent = ::PromoDigestSettings.coinflip_skip_percent
 
       is_skipped_haspromo = has_tagged_in_top
       is_skipped_coinflip = false
@@ -636,11 +738,10 @@ after_initialize do
       watched_filter_applied = false
 
       last_digest_sent_at = last_digest_sent_at_for_user(user)
-      created_after_last_digest_filter_enabled = (::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
+      created_after_last_digest_filter_enabled = ::PromoDigestSettings.filter_promo_topics_created_after_last_digest?
       created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && last_digest_sent_at.present?)
 
-      promo_pick_mode = ::PromoDigestConfig::PROMO_PICK_MODE.to_s.strip
-      promo_pick_mode = "global" if promo_pick_mode.empty?
+      promo_pick_mode = ::PromoDigestSettings.promo_pick_mode
       prefer_digest_list_mode = (promo_pick_mode == "prefer_digest_list")
 
       digest_list_candidates_count = 0
@@ -649,12 +750,9 @@ after_initialize do
       fallback_picked = []
       used_fallback_outside_digest = false
 
-      no_watched_shuffle_enabled = (::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_CATEGORIES == true)
-      no_watched_shuffle_top_n   = ::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_TOP_N.to_i
-      no_watched_shuffle_top_n   = 4 if no_watched_shuffle_top_n <= 0
-      no_watched_shuffle_coinflip_percent = ::PromoDigestConfig::SHUFFLE_TOPICS_IF_NO_WATCHED_COINFLIP_PERCENT.to_i
-      no_watched_shuffle_coinflip_percent = 0 if no_watched_shuffle_coinflip_percent < 0
-      no_watched_shuffle_coinflip_percent = 100 if no_watched_shuffle_coinflip_percent > 100
+      no_watched_shuffle_enabled = ::PromoDigestSettings.shuffle_topics_if_no_watched_categories?
+      no_watched_shuffle_top_n   = ::PromoDigestSettings.shuffle_topics_if_no_watched_top_n
+      no_watched_shuffle_coinflip_percent = ::PromoDigestSettings.shuffle_topics_if_no_watched_coinflip_percent
       no_watched_shuffle_applied = false
 
       watched_percent_enforcer_applied = false
@@ -673,8 +771,7 @@ after_initialize do
       superpromo_watched_category_ids = []
       superpromo_watched_filter_applied = false
 
-      superpromo_pick_mode = ::PromoDigestConfig::SUPERPROMO_PICK_MODE.to_s.strip
-      superpromo_pick_mode = "global" if superpromo_pick_mode.empty?
+      superpromo_pick_mode = ::PromoDigestSettings.superpromo_pick_mode
       superpromo_prefer_digest_list_mode = (superpromo_pick_mode == "prefer_digest_list")
 
       superpromo_digest_list_candidates_count = 0
@@ -683,7 +780,7 @@ after_initialize do
       superpromo_fallback_picked = []
       superpromo_used_fallback_outside_digest = false
 
-      superpromo_created_after_enabled = (::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true)
+      superpromo_created_after_enabled = ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?
       superpromo_created_after_applied = (superpromo_created_after_enabled && last_digest_sent_at.present?)
 
       # ============================================================
@@ -693,11 +790,8 @@ after_initialize do
         if rand(100) < skip_percent
           is_skipped_coinflip = true
         else
-          replace_within_top_n = ::PromoDigestConfig::REPLACE_WITHIN_TOP_N.to_i
-          replace_within_top_n = 3 if replace_within_top_n <= 0
-
-          replace_count = ::PromoDigestConfig::REPLACE_COUNT.to_i
-          replace_count = 1 if replace_count <= 0
+          replace_within_top_n = ::PromoDigestSettings.replace_within_top_n
+          replace_count = ::PromoDigestSettings.replace_count
 
           window = [replace_within_top_n, final_ids.length].min
           if window > 0 && replace_count > 0
@@ -793,12 +887,7 @@ after_initialize do
       # ============================================================
       # SUPERPROMO injection block (runs SECOND, independent)
       # ============================================================
-   if ::PromoDigestConfig::SUPERPROMO_ENABLED == true &&
-   !is_skipped_min_digests &&
-   final_ids.present? &&
-   superpromo_tag_ids.present?
-
-        # Determine whether there is already a superpromo tag in top N (using superpromo watched settings)
+      if ::PromoDigestSettings.superpromo_enabled? && final_ids.present? && superpromo_tag_ids.present?
         superpromo_tagged_ids_set =
           begin
             w2 = watched_category_ids_for_user_superpromo(user)
@@ -811,8 +900,7 @@ after_initialize do
             Set.new
           end
 
-        superpromo_min_position = ::PromoDigestConfig::SUPERPROMO_MIN_POSITION.to_i
-        superpromo_min_position = 3 if superpromo_min_position <= 0
+        superpromo_min_position = ::PromoDigestSettings.superpromo_min_position
 
         superpromo_has_tagged_in_top =
           if final_ids.present?
@@ -823,19 +911,14 @@ after_initialize do
 
         superpromo_is_skipped_hastag = superpromo_has_tagged_in_top
 
-        superpromo_skip_percent = ::PromoDigestConfig::SUPERPROMO_COINFLIP_SKIP_PERCENT.to_i
-        superpromo_skip_percent = 0 if superpromo_skip_percent < 0
-        superpromo_skip_percent = 100 if superpromo_skip_percent > 100
+        superpromo_skip_percent = ::PromoDigestSettings.superpromo_coinflip_skip_percent
 
         if !superpromo_is_skipped_hastag
           if rand(100) < superpromo_skip_percent
             superpromo_is_skipped_coinflip = true
           else
-            within_top_n = ::PromoDigestConfig::SUPERPROMO_REPLACE_WITHIN_TOP_N.to_i
-            within_top_n = 3 if within_top_n <= 0
-
-            sp_replace_count = ::PromoDigestConfig::SUPERPROMO_REPLACE_COUNT.to_i
-            sp_replace_count = 1 if sp_replace_count <= 0
+            within_top_n = ::PromoDigestSettings.superpromo_replace_within_top_n
+            sp_replace_count = ::PromoDigestSettings.superpromo_replace_count
 
             window = [within_top_n, final_ids.length].min
             if window > 0 && sp_replace_count > 0
@@ -1094,7 +1177,7 @@ after_initialize do
     def self.extract_limit(opts)
       l = opts.is_a?(Hash) ? (opts[:limit] || opts["limit"]) : nil
       l = l.to_i if l
-      l = ::PromoDigestConfig::DEFAULT_DIGEST_LIMIT if l.nil? || l <= 0
+      l = ::PromoDigestSettings.default_digest_limit if l.nil? || l <= 0
       l
     end
 
@@ -1166,18 +1249,18 @@ after_initialize do
 
     # ---------- WATCHED CATEGORY HELPERS ----------
     def self.watched_category_ids_for_user(user)
-      return [] unless ::PromoDigestConfig::USE_WATCHED_CATEGORIES
+      return [] unless ::PromoDigestSettings.use_watched_categories?
       return [] if user.nil?
 
       levels = []
       if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
         nl = CategoryUser.notification_levels
         levels << (nl[:watching] || 3)
-        if ::PromoDigestConfig::INCLUDE_WATCHING_FIRST_POST
+        if ::PromoDigestSettings.include_watching_first_post?
           levels << (nl[:watching_first_post] || 4)
         end
       else
-        levels = ::PromoDigestConfig::INCLUDE_WATCHING_FIRST_POST ? [3, 4] : [3]
+        levels = ::PromoDigestSettings.include_watching_first_post? ? [3, 4] : [3]
       end
 
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
@@ -1186,20 +1269,19 @@ after_initialize do
       []
     end
 
-    # SUPERPROMO watched categories (independent knobs)
     def self.watched_category_ids_for_user_superpromo(user)
-      return [] unless ::PromoDigestConfig::SUPERPROMO_USE_WATCHED_CATEGORIES
+      return [] unless ::PromoDigestSettings.superpromo_use_watched_categories?
       return [] if user.nil?
 
       levels = []
       if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
         nl = CategoryUser.notification_levels
         levels << (nl[:watching] || 3)
-        if ::PromoDigestConfig::SUPERPROMO_INCLUDE_WATCHING_FIRST_POST
+        if ::PromoDigestSettings.superpromo_include_watching_first_post?
           levels << (nl[:watching_first_post] || 4)
         end
       else
-        levels = ::PromoDigestConfig::SUPERPROMO_INCLUDE_WATCHING_FIRST_POST ? [3, 4] : [3]
+        levels = ::PromoDigestSettings.superpromo_include_watching_first_post? ? [3, 4] : [3]
       end
 
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
@@ -1219,11 +1301,9 @@ after_initialize do
     )
       return ids if user.nil?
       return ids if ids.blank?
-      return ids unless ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY
+      return ids unless ::PromoDigestSettings.force_first_topic_from_watched_category?
 
-      pct = ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT.to_i
-      pct = 0 if pct < 0
-      pct = 100 if pct > 100
+      pct = ::PromoDigestSettings.force_first_topic_watched_coinflip_percent
       return ids if pct == 0
       return ids if pct < 100 && rand(100) >= pct
 
@@ -1232,8 +1312,7 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
-      randomize_even_if_already_watched =
-        (::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED == true)
+      randomize_even_if_already_watched = ::PromoDigestSettings.force_first_topic_randomize_even_if_already_watched?
 
       if !randomize_even_if_already_watched
         first_id = ids.first.to_i
@@ -1250,7 +1329,7 @@ after_initialize do
         end
       end
 
-      lookahead = ::PromoDigestConfig::FORCE_FIRST_TOPIC_LOOKAHEAD.to_i
+      lookahead = ::PromoDigestSettings.force_first_topic_lookahead
       lookahead = ids.length if lookahead <= 0
       window_ids = ids.first([lookahead, ids.length].min)
 
@@ -1280,14 +1359,13 @@ after_initialize do
         preferred_rows = promo_rows if promo_rows.present?
       end
 
-      require_created_after = (::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST == true)
-      soft_fallback = (::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK == true)
+      require_created_after = ::PromoDigestSettings.force_first_topic_require_created_after_last_digest?
+      soft_fallback = ::PromoDigestSettings.force_first_topic_soft_fallback?
 
       last_ts = nil
       last_ts = last_digest_sent_at_for_user(user) if require_created_after
 
-      top_n = ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOM_TOP_N.to_i
-      top_n = 5 if top_n <= 0
+      top_n = ::PromoDigestSettings.force_first_topic_random_top_n
 
       sort_newest_first = lambda do |arr|
         arr.sort_by do |tid, _cid, created|
@@ -1353,7 +1431,7 @@ after_initialize do
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+      if ::PromoDigestSettings.filter_promo_topics_created_after_last_digest? && created_after.present?
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
@@ -1399,7 +1477,7 @@ after_initialize do
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+      if ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest? && created_after.present?
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
@@ -1496,12 +1574,11 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestConfig::FILTER_PROMO_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+      if ::PromoDigestSettings.filter_promo_topics_created_after_last_digest? && created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
-      scan_cap = ::PromoDigestConfig::PROMO_CANDIDATE_SCAN_CAP.to_i
-      scan_cap = 500 if scan_cap <= 0
+      scan_cap = ::PromoDigestSettings.promo_candidate_scan_cap
 
       candidate_ids =
         topic_tag_scope
@@ -1555,12 +1632,11 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestConfig::SUPERPROMO_FILTER_TOPICS_CREATED_AFTER_LAST_DIGEST == true && created_after.present?
+      if ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest? && created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
-      scan_cap = ::PromoDigestConfig::SUPERPROMO_CANDIDATE_SCAN_CAP.to_i
-      scan_cap = 500 if scan_cap <= 0
+      scan_cap = ::PromoDigestSettings.superpromo_candidate_scan_cap
 
       candidate_ids =
         topic_tag_scope
@@ -1632,7 +1708,7 @@ after_initialize do
 
     def self.pack_topics(ids)
       return [] if ids.blank?
-      return ids if ::PromoDigestConfig::SEND_IDS_ONLY
+      return ids if ::PromoDigestSettings.send_ids_only?
       serialize_topics(ids)
     end
 
@@ -1717,7 +1793,7 @@ after_initialize do
       debug_for_digest_callsite:,
       debug_dedupe_key:
     )
-      endpoint = ::PromoDigestConfig::ENDPOINT_URL.to_s.strip
+      endpoint = ::PromoDigestSettings.endpoint_url
       return if endpoint.empty?
 
       now_iso = Time.now.utc.iso8601
@@ -1773,19 +1849,19 @@ after_initialize do
           user_watched_category_ids: user_watched_category_ids,
 
           watched_category_ids: watched_category_ids,
-          watched_categories_mode: ::PromoDigestConfig::USE_WATCHED_CATEGORIES,
+          watched_categories_mode: ::PromoDigestSettings.use_watched_categories?,
           watched_filter_applied: watched_filter_applied,
 
-          watched_percent_enforcer_enabled: ::PromoDigestConfig::ENFORCE_MIN_WATCHED_CATEGORY_PERCENT,
+          watched_percent_enforcer_enabled: ::PromoDigestSettings.enforce_min_watched_category_percent?,
           watched_percent_enforcer_applied: watched_percent_enforcer_applied,
           watched_percent_enforcer_debug: watched_percent_debug,
 
-          forced_first_topic_from_watched_category_enabled: ::PromoDigestConfig::FORCE_FIRST_TOPIC_FROM_WATCHED_CATEGORY,
-          forced_first_topic_coinflip_percent: ::PromoDigestConfig::FORCE_FIRST_TOPIC_WATCHED_COINFLIP_PERCENT,
-          force_first_topic_randomize_even_if_already_watched: ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOMIZE_EVEN_IF_ALREADY_WATCHED,
-          force_first_topic_random_top_n: ::PromoDigestConfig::FORCE_FIRST_TOPIC_RANDOM_TOP_N,
-          forced_first_topic_require_created_after_last_digest: ::PromoDigestConfig::FORCE_FIRST_TOPIC_REQUIRE_CREATED_AFTER_LAST_DIGEST,
-          forced_first_topic_soft_fallback: ::PromoDigestConfig::FORCE_FIRST_TOPIC_SOFT_FALLBACK,
+          forced_first_topic_from_watched_category_enabled: ::PromoDigestSettings.force_first_topic_from_watched_category?,
+          forced_first_topic_coinflip_percent: ::PromoDigestSettings.force_first_topic_watched_coinflip_percent,
+          force_first_topic_randomize_even_if_already_watched: ::PromoDigestSettings.force_first_topic_randomize_even_if_already_watched?,
+          force_first_topic_random_top_n: ::PromoDigestSettings.force_first_topic_random_top_n,
+          forced_first_topic_require_created_after_last_digest: ::PromoDigestSettings.force_first_topic_require_created_after_last_digest?,
+          forced_first_topic_soft_fallback: ::PromoDigestSettings.force_first_topic_soft_fallback?,
           forced_first_topic_applied: forced_first_applied,
 
           shuffle_if_no_watched_categories_enabled: no_watched_shuffle_enabled,
@@ -1807,9 +1883,8 @@ after_initialize do
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices,
 
-          # -------- SUPERPROMO --------
           superpromo: {
-            enabled: ::PromoDigestConfig::SUPERPROMO_ENABLED,
+            enabled: ::PromoDigestSettings.superpromo_enabled?,
             tag: superpromo_tag,
             tag_ids: superpromo_tag_ids,
             injected_topic_ids: superpromo_injected_ids,
@@ -1820,7 +1895,7 @@ after_initialize do
             candidate_pool_count: superpromo_candidate_pool_count,
             visible_pool_count: superpromo_visible_pool_count,
             watched_category_ids: superpromo_watched_category_ids,
-            watched_categories_mode: ::PromoDigestConfig::SUPERPROMO_USE_WATCHED_CATEGORIES,
+            watched_categories_mode: ::PromoDigestSettings.superpromo_use_watched_categories?,
             watched_filter_applied: superpromo_watched_filter_applied,
             pick_mode: superpromo_pick_mode,
             digest_list_candidates_count: superpromo_digest_list_candidates_count,
@@ -1836,11 +1911,11 @@ after_initialize do
 
       Jobs.enqueue(
         :promo_digest_send_summary,
-        endpoint_url: ::PromoDigestConfig::ENDPOINT_URL,
-        secret: ::PromoDigestConfig::SECRET_HEADER_VALUE,
-        log_post_results: ::PromoDigestConfig::LOG_POST_RESULTS,
-        open_timeout: ::PromoDigestConfig::HTTP_OPEN_TIMEOUT,
-        read_timeout: ::PromoDigestConfig::HTTP_READ_TIMEOUT,
+        endpoint_url: endpoint,
+        secret: ::PromoDigestSettings.secret_header_value,
+        log_post_results: ::PromoDigestSettings.log_post_results?,
+        open_timeout: ::PromoDigestSettings.http_open_timeout,
+        read_timeout: ::PromoDigestSettings.http_read_timeout,
         payload_json: payload.to_json
       )
     rescue => e
@@ -1872,7 +1947,6 @@ after_initialize do
   # Hook: captures since/opts/callsite for each Topic.for_digest call,
   # then ONLY injects/logs for the REAL digest call:
   #   opts is Hash AND opts[:top_order] == true AND opts[:limit] present
-  # (skips Post.for_mailing_list calls, etc.)
   # ============================================================
   module ::PromoDigestForDigestOverride
     def for_digest(user, since, opts = nil)
@@ -1883,14 +1957,12 @@ after_initialize do
         Thread.current[:promo_digest_since] = since
         Thread.current[:promo_digest_opts_sanitized] = ::PromoDigestInjector.sanitize_opts_for_debug(opts)
 
-        depth = ::PromoDigestConfig::DEBUG_CALLSITE_DEPTH.to_i
-        depth = 10 if depth <= 0
+        depth = ::PromoDigestSettings.debug_callsite_depth
         Thread.current[:promo_digest_callsite] = caller_locations(0, depth).map(&:to_s)
       end
 
       rel = super(user, since, opts)
 
-      # Guard: only run injector for the real digest for_digest call
       return rel unless Thread.current[:promo_digest_in_digest] == true
       return rel unless opts.is_a?(Hash)
 
