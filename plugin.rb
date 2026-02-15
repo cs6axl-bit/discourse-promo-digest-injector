@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.4.0
+# version: 1.4.1
 # authors: you
 
 after_initialize do
@@ -20,6 +20,12 @@ after_initialize do
   module ::PromoDigestSettings
     def self.enabled?
       SiteSetting.promo_digest_injector_enabled == true
+    end
+
+    # NEW: independent master switch for REGULAR promo injection only
+    # (superpromo remains independent)
+    def self.regular_injection_enabled?
+      SiteSetting.promo_digest_injector_regular_enabled == true
     end
 
     def self.min_digests_before_inject
@@ -785,8 +791,11 @@ after_initialize do
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
+      # NOW ALSO gated by SiteSetting: promo_digest_injector_regular_enabled
       # ============================================================
-      if !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present? && tag_ids.present?
+      if ::PromoDigestSettings.regular_injection_enabled? &&
+         !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present? && tag_ids.present?
+
         if rand(100) < skip_percent
           is_skipped_coinflip = true
         else
@@ -1882,6 +1891,9 @@ after_initialize do
 
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices,
+
+          # NEW: record switch state in debug so your PHP table can see it
+          regular_injection_enabled: ::PromoDigestSettings.regular_injection_enabled?,
 
           superpromo: {
             enabled: ::PromoDigestSettings.superpromo_enabled?,
