@@ -1,0 +1,204 @@
+plugins:
+  promo_digest_injector_enabled:
+    default: true
+    client: false
+
+  promo_digest_injector_min_digests_before_inject:
+    default: 3
+    client: false
+
+  promo_digest_injector_digest_count_custom_field:
+    default: "digest_sent_counter"
+    client: false
+
+  promo_digest_injector_promo_tags:
+    default: "helpful|useful"
+    client: false
+
+  promo_digest_injector_use_watched_categories:
+    default: true
+    client: false
+
+  promo_digest_injector_include_watching_first_post:
+    default: true
+    client: false
+
+  promo_digest_injector_min_position:
+    default: 3
+    client: false
+
+  promo_digest_injector_coinflip_skip_percent:
+    default: 30
+    client: false
+
+  promo_digest_injector_replace_within_top_n:
+    default: 3
+    client: false
+
+  promo_digest_injector_replace_count:
+    default: 1
+    client: false
+
+  promo_digest_injector_default_digest_limit:
+    default: 50
+    client: false
+
+  promo_digest_injector_endpoint_url:
+    default: "http://172.17.0.1:8081/digest_inject.php"
+    client: false
+
+  promo_digest_injector_secret_header_value:
+    default: ""
+    client: false
+
+  promo_digest_injector_log_post_results:
+    default: false
+    client: false
+
+  promo_digest_injector_http_open_timeout:
+    default: 3
+    client: false
+
+  promo_digest_injector_http_read_timeout:
+    default: 5
+    client: false
+
+  promo_digest_injector_send_ids_only:
+    default: true
+    client: false
+
+  promo_digest_injector_last_digest_topics_field:
+    default: "promo_digest_last50_topic_ids"
+    client: false
+
+  promo_digest_injector_last_digest_topics_max:
+    default: 50
+    client: false
+
+  promo_digest_injector_last_digest_first_topics_field:
+    default: "promo_digest_last10_first_topic_ids"
+    client: false
+
+  promo_digest_injector_last_digest_first_topics_max:
+    default: 10
+    client: false
+
+  promo_digest_injector_force_first_topic_from_watched_category:
+    default: true
+    client: false
+
+  promo_digest_injector_force_first_topic_watched_coinflip_percent:
+    default: 100
+    client: false
+
+  promo_digest_injector_force_first_topic_randomize_even_if_already_watched:
+    default: true
+    client: false
+
+  promo_digest_injector_force_first_topic_random_top_n:
+    default: 5
+    client: false
+
+  promo_digest_injector_force_first_topic_require_created_after_last_digest:
+    default: true
+    client: false
+
+  promo_digest_injector_force_first_topic_soft_fallback:
+    default: true
+    client: false
+
+  promo_digest_injector_force_first_topic_lookahead:
+    default: 50
+    client: false
+
+  promo_digest_injector_filter_promo_topics_created_after_last_digest:
+    default: true
+    client: false
+
+  promo_digest_injector_shuffle_topics_if_no_watched_categories:
+    default: true
+    client: false
+
+  promo_digest_injector_shuffle_topics_if_no_watched_top_n:
+    default: 4
+    client: false
+
+  promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent:
+    default: 100
+    client: false
+
+  promo_digest_injector_promo_pick_mode:
+    default: "prefer_digest_list"
+    client: false
+
+  promo_digest_injector_promo_candidate_scan_cap:
+    default: 500
+    client: false
+
+  promo_digest_injector_enforce_min_watched_category_percent:
+    default: true
+    client: false
+
+  promo_digest_injector_min_watched_category_percent:
+    default: 50
+    client: false
+
+  promo_digest_injector_watched_enforce_lookahead_extra:
+    default: 100
+    client: false
+
+  promo_digest_injector_watched_enforce_forum_scan_cap:
+    default: 500
+    client: false
+
+  promo_digest_injector_superpromo_enabled:
+    default: false
+    client: false
+
+  promo_digest_injector_superpromo_tags:
+    default: "trusted"
+    client: false
+
+  promo_digest_injector_superpromo_use_watched_categories:
+    default: true
+    client: false
+
+  promo_digest_injector_superpromo_include_watching_first_post:
+    default: true
+    client: false
+
+  promo_digest_injector_superpromo_min_position:
+    default: 3
+    client: false
+
+  promo_digest_injector_superpromo_coinflip_skip_percent:
+    default: 30
+    client: false
+
+  promo_digest_injector_superpromo_replace_within_top_n:
+    default: 3
+    client: false
+
+  promo_digest_injector_superpromo_replace_count:
+    default: 1
+    client: false
+
+  promo_digest_injector_superpromo_filter_topics_created_after_last_digest:
+    default: true
+    client: false
+
+  promo_digest_injector_superpromo_pick_mode:
+    default: "prefer_digest_list"
+    client: false
+
+  promo_digest_injector_superpromo_candidate_scan_cap:
+    default: 500
+    client: false
+
+  promo_digest_injector_debug_callsite_depth:
+    default: 10
+    client: false
+
+  promo_digest_injector_debug_include_opts:
+    default: true
+    client: false
