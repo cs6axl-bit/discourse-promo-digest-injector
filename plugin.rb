@@ -984,7 +984,10 @@ after_initialize do
       # ============================================================
       # SUPERPROMO injection block (runs SECOND, independent)
       # ============================================================
-      if ::PromoDigestSettings.superpromo_enabled? && final_ids.present? && superpromo_tag_ids.present?
+      if ::PromoDigestSettings.superpromo_enabled? &&
+   !is_skipped_min_digests &&
+   final_ids.present? && superpromo_tag_ids.present?
+
         superpromo_tagged_ids_set =
           begin
             w2 = watched_category_ids_for_user_superpromo(user)
@@ -1113,7 +1116,10 @@ after_initialize do
       # ============================================================
       # HARDSALE injection block (runs THIRD, independent, after superpromo)
       # ============================================================
-      if ::PromoDigestSettings.hardsale_enabled? && final_ids.present? && hardsale_tag_ids.present?
+if ::PromoDigestSettings.hardsale_enabled? &&
+   !is_skipped_min_digests &&
+   final_ids.present? && hardsale_tag_ids.present?
+
         hardsale_tagged_ids_set =
           begin
             w3 = watched_category_ids_for_user_hardsale(user)
