@@ -8,7 +8,7 @@ plugins:
     default: true
     client: false
 
-  # NEW: disables ONLY the "regular promo" injection block (superpromo still runs)
+  # NEW: disables ONLY the "regular promo" injection block (superpromo/hardsale still run)
   promo_digest_injector_regular_enabled:
     default: true
     client: false
@@ -144,6 +144,63 @@ plugins:
     client: false
 
   # =========================
+  # HARDSALE PROMOS (NEW independent pipeline)
+  # =========================
+  promo_digest_injector_hardsale_enabled:
+    default: false
+    client: false
+
+  promo_digest_injector_hardsale_tags:
+    default: "hardsale"
+    client: false
+
+  promo_digest_injector_hardsale_use_watched_categories:
+    default: false
+    client: false
+
+  promo_digest_injector_hardsale_include_watching_first_post:
+    default: true
+    client: false
+
+  promo_digest_injector_hardsale_min_position:
+    default: 3
+    min: 1
+    max: 50
+    client: false
+
+  promo_digest_injector_hardsale_coinflip_skip_percent:
+    default: 0
+    min: 0
+    max: 100
+    client: false
+
+  promo_digest_injector_hardsale_replace_within_top_n:
+    default: 3
+    min: 1
+    max: 50
+    client: false
+
+  promo_digest_injector_hardsale_replace_count:
+    default: 1
+    min: 1
+    max: 50
+    client: false
+
+  promo_digest_injector_hardsale_filter_topics_created_after_last_digest:
+    default: false
+    client: false
+
+  promo_digest_injector_hardsale_pick_mode:
+    default: "prefer_digest_list"
+    client: false
+
+  promo_digest_injector_hardsale_candidate_scan_cap:
+    default: 500
+    min: 1
+    max: 50000
+    client: false
+
+  # =========================
   # WATCHED-CATEGORY PERCENT ENFORCER
   # =========================
   promo_digest_injector_enforce_min_watched_category_percent:
@@ -207,8 +264,6 @@ plugins:
 
   # =========================
   # SHUFFLE TOPICS IF USER HAS NO WATCHED CATEGORIES
-  # NOTE: key name MUST match your ruby:
-  # SiteSetting.promo_digest_injector_shuffle_topics_if_no_watched_coinflip_percent
   # =========================
   promo_digest_injector_shuffle_topics_if_no_watched_categories:
     default: false
