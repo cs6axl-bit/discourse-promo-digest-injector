@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.4.1
+# version: 1.5.0
 # authors: you
 
 after_initialize do
@@ -23,7 +23,7 @@ after_initialize do
     end
 
     # NEW: independent master switch for REGULAR promo injection only
-    # (superpromo remains independent)
+    # (superpromo/hardsale remain independent)
     def self.regular_injection_enabled?
       SiteSetting.promo_digest_injector_regular_enabled == true
     end
@@ -260,6 +260,63 @@ after_initialize do
 
     def self.superpromo_candidate_scan_cap
       v = SiteSetting.promo_digest_injector_superpromo_candidate_scan_cap.to_i
+      v <= 0 ? 500 : v
+    end
+
+    # -------- HARDSALE (NEW) --------
+    def self.hardsale_enabled?
+      SiteSetting.promo_digest_injector_hardsale_enabled == true
+    end
+
+    def self.hardsale_tags
+      raw = SiteSetting.promo_digest_injector_hardsale_tags.to_s
+      raw.split("|").map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+    end
+
+    def self.hardsale_use_watched_categories?
+      SiteSetting.promo_digest_injector_hardsale_use_watched_categories == true
+    end
+
+    def self.hardsale_include_watching_first_post?
+      SiteSetting.promo_digest_injector_hardsale_include_watching_first_post == true
+    end
+
+    def self.hardsale_min_position
+      v = SiteSetting.promo_digest_injector_hardsale_min_position.to_i
+      v <= 0 ? 3 : v
+    end
+
+    def self.hardsale_coinflip_skip_percent
+      v = SiteSetting.promo_digest_injector_hardsale_coinflip_skip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    end
+
+    def self.hardsale_replace_within_top_n
+      v = SiteSetting.promo_digest_injector_hardsale_replace_within_top_n.to_i
+      v <= 0 ? 3 : v
+      v
+    end
+
+    def self.hardsale_replace_count
+      v = SiteSetting.promo_digest_injector_hardsale_replace_count.to_i
+      v <= 0 ? 1 : v
+      v
+    end
+
+    def self.hardsale_filter_topics_created_after_last_digest?
+      SiteSetting.promo_digest_injector_hardsale_filter_topics_created_after_last_digest == true
+    end
+
+    def self.hardsale_pick_mode
+      m = SiteSetting.promo_digest_injector_hardsale_pick_mode.to_s.strip
+      m = "prefer_digest_list" if m.empty?
+      m
+    end
+
+    def self.hardsale_candidate_scan_cap
+      v = SiteSetting.promo_digest_injector_hardsale_candidate_scan_cap.to_i
       v <= 0 ? 500 : v
     end
 
@@ -675,6 +732,12 @@ after_initialize do
       superpromo_tag_models = superpromo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       superpromo_tag_ids = superpromo_tag_models.map(&:id).compact.uniq
 
+      # HARDSALE tags (NEW independent pipeline)
+      hardsale_tags = ::PromoDigestSettings.hardsale_tags
+      hardsale_tag_for_payload = hardsale_tags.join(", ")
+      hardsale_tag_models = hardsale_tags.map { |t| find_tag_by_name_ci(t) }.compact
+      hardsale_tag_ids = hardsale_tag_models.map(&:id).compact.uniq
+
       user_watched_category_ids = watched_category_ids_for_user(user)
 
       # ---------- DEBUG CONTEXT ----------
@@ -788,6 +851,31 @@ after_initialize do
 
       superpromo_created_after_enabled = ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?
       superpromo_created_after_applied = (superpromo_created_after_enabled && last_digest_sent_at.present?)
+
+      # -------- HARDSALE tracking vars (NEW) --------
+      hardsale_has_tagged_in_top = false
+      hardsale_is_skipped_hastag = false
+      hardsale_is_skipped_coinflip = false
+      hardsale_attempted_replace = false
+      hardsale_replace_indices = []
+      hardsale_injected_ids = []
+
+      hardsale_candidate_pool_count = 0
+      hardsale_visible_pool_count = 0
+      hardsale_watched_category_ids = []
+      hardsale_watched_filter_applied = false
+
+      hardsale_pick_mode = ::PromoDigestSettings.hardsale_pick_mode
+      hardsale_prefer_digest_list_mode = (hardsale_pick_mode == "prefer_digest_list")
+
+      hardsale_digest_list_candidates_count = 0
+      hardsale_digest_list_visible_count = 0
+      hardsale_digest_list_picked = []
+      hardsale_fallback_picked = []
+      hardsale_used_fallback_outside_digest = false
+
+      hardsale_created_after_enabled = ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest?
+      hardsale_created_after_applied = (hardsale_created_after_enabled && last_digest_sent_at.present?)
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
@@ -1023,7 +1111,136 @@ after_initialize do
       end
 
       # ============================================================
-      # Enforce minimum % watched-category topics (AFTER promo+superpromo, BEFORE first-topic logic)
+      # HARDSALE injection block (runs THIRD, independent, after superpromo)
+      # ============================================================
+      if ::PromoDigestSettings.hardsale_enabled? && final_ids.present? && hardsale_tag_ids.present?
+        hardsale_tagged_ids_set =
+          begin
+            w3 = watched_category_ids_for_user_hardsale(user)
+            if w3.present?
+              fetch_tagged_topic_ids_any_tag_in_categories(final_ids, hardsale_tag_ids, w3).to_set
+            else
+              fetch_tagged_topic_ids_any_tag(final_ids, hardsale_tag_ids).to_set
+            end
+          rescue
+            Set.new
+          end
+
+        hardsale_min_position = ::PromoDigestSettings.hardsale_min_position
+
+        hardsale_has_tagged_in_top =
+          if final_ids.present?
+            final_ids.first(hardsale_min_position).any? { |tid| hardsale_tagged_ids_set.include?(tid) }
+          else
+            false
+          end
+
+        hardsale_is_skipped_hastag = hardsale_has_tagged_in_top
+
+        hardsale_skip_percent = ::PromoDigestSettings.hardsale_coinflip_skip_percent
+
+        if !hardsale_is_skipped_hastag
+          if rand(100) < hardsale_skip_percent
+            hardsale_is_skipped_coinflip = true
+          else
+            within_top_n = ::PromoDigestSettings.hardsale_replace_within_top_n
+            hs_replace_count = ::PromoDigestSettings.hardsale_replace_count
+
+            window = [within_top_n, final_ids.length].min
+            if window > 0 && hs_replace_count > 0
+              hardsale_attempted_replace = true
+              hardsale_replace_indices = (0...window).to_a.sample([hs_replace_count, window].min)
+
+              if hardsale_prefer_digest_list_mode
+                tmp_ids = final_ids.dup
+
+                eligible_set, cand_ct, vis_ct, watched_ids, watched_applied =
+                  eligible_hardsale_set_within_digest_list(
+                    user,
+                    tag_ids: hardsale_tag_ids,
+                    digest_ids: final_ids, # operate on post-promo+superpromo list
+                    created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                  )
+
+                hardsale_digest_list_candidates_count = cand_ct
+                hardsale_digest_list_visible_count = vis_ct
+                hardsale_watched_category_ids = watched_ids
+                hardsale_watched_filter_applied = watched_applied
+
+                _satisfied, swapped_in_ids, remaining_indices =
+                  swap_eligible_promos_into_indices(
+                    tmp_ids,
+                    hardsale_replace_indices,
+                    eligible_set
+                  )
+
+                hardsale_digest_list_picked = swapped_in_ids.dup
+
+                if remaining_indices.any?
+                  remaining_need = remaining_indices.length
+
+                  fallback_ids, cand_b, vis_b, watched_b, watched_applied_b =
+                    pick_random_hardsale_topic_ids(
+                      user,
+                      tag_ids: hardsale_tag_ids,
+                      exclude_ids: tmp_ids,
+                      limit: remaining_need,
+                      created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                    )
+
+                  hardsale_used_fallback_outside_digest = fallback_ids.present?
+                  hardsale_fallback_picked = fallback_ids.dup
+
+                  hardsale_candidate_pool_count = cand_ct + cand_b
+                  hardsale_visible_pool_count = vis_ct + vis_b
+
+                  hardsale_watched_category_ids = watched_b
+                  hardsale_watched_filter_applied = watched_applied_b
+
+                  if fallback_ids.length == remaining_need
+                    remaining_indices.each_with_index do |idx, j|
+                      tmp_ids[idx] = fallback_ids[j]
+                    end
+
+                    final_ids = tmp_ids
+                    hardsale_injected_ids = swapped_in_ids + fallback_ids
+                  else
+                    hardsale_injected_ids = []
+                    hardsale_replace_indices = []
+                  end
+                else
+                  hardsale_candidate_pool_count = cand_ct
+                  hardsale_visible_pool_count = vis_ct
+                  final_ids = tmp_ids
+                  hardsale_injected_ids = swapped_in_ids
+                end
+              else
+                hardsale_injected_ids, hardsale_candidate_pool_count, hardsale_visible_pool_count,
+                  hardsale_watched_category_ids, hardsale_watched_filter_applied =
+                    pick_random_hardsale_topic_ids(
+                      user,
+                      tag_ids: hardsale_tag_ids,
+                      exclude_ids: final_ids,
+                      limit: hardsale_replace_indices.length,
+                      created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                    )
+
+                if hardsale_injected_ids.length == hardsale_replace_indices.length
+                  hardsale_replace_indices.each_with_index do |idx, j|
+                    final_ids[idx] = hardsale_injected_ids[j]
+                  end
+                else
+                  hardsale_injected_ids = []
+                  hardsale_replace_indices = []
+                end
+              end
+            end
+          end
+        end
+      end
+
+      # ============================================================
+      # Enforce minimum % watched-category topics (AFTER promo+superpromo+hardsale, BEFORE first-topic logic)
       # ============================================================
       begin
         final_ids, watched_percent_enforcer_applied, watched_percent_debug, _ =
@@ -1167,6 +1384,27 @@ after_initialize do
         superpromo_created_after_enabled: superpromo_created_after_enabled,
         superpromo_created_after_applied: superpromo_created_after_applied,
 
+        # -------- HARDSALE DEBUG (NEW) --------
+        hardsale_tag: hardsale_tag_for_payload,
+        hardsale_tag_ids: hardsale_tag_ids,
+        hardsale_injected_ids: hardsale_injected_ids,
+        hardsale_attempted_replace: hardsale_attempted_replace,
+        hardsale_replace_indices: hardsale_replace_indices,
+        hardsale_is_skipped_hastag: hardsale_is_skipped_hastag,
+        hardsale_is_skipped_coinflip: hardsale_is_skipped_coinflip,
+        hardsale_candidate_pool_count: hardsale_candidate_pool_count,
+        hardsale_visible_pool_count: hardsale_visible_pool_count,
+        hardsale_watched_category_ids: hardsale_watched_category_ids,
+        hardsale_watched_filter_applied: hardsale_watched_filter_applied,
+        hardsale_pick_mode: hardsale_pick_mode,
+        hardsale_digest_list_candidates_count: hardsale_digest_list_candidates_count,
+        hardsale_digest_list_visible_count: hardsale_digest_list_visible_count,
+        hardsale_digest_list_picked: hardsale_digest_list_picked,
+        hardsale_fallback_picked: hardsale_fallback_picked,
+        hardsale_used_fallback_outside_digest: hardsale_used_fallback_outside_digest,
+        hardsale_created_after_enabled: hardsale_created_after_enabled,
+        hardsale_created_after_applied: hardsale_created_after_applied,
+
         # -------- DEBUG --------
         debug_digest_build_uuid: digest_build_uuid,
         debug_for_digest_call_index: for_digest_call_index,
@@ -1296,6 +1534,27 @@ after_initialize do
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user_superpromo failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    def self.watched_category_ids_for_user_hardsale(user)
+      return [] unless ::PromoDigestSettings.hardsale_use_watched_categories?
+      return [] if user.nil?
+
+      levels = []
+      if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
+        nl = CategoryUser.notification_levels
+        levels << (nl[:watching] || 3)
+        if ::PromoDigestSettings.hardsale_include_watching_first_post?
+          levels << (nl[:watching_first_post] || 4)
+        end
+      else
+        levels = ::PromoDigestSettings.hardsale_include_watching_first_post? ? [3, 4] : [3]
+      end
+
+      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user_hardsale failed: #{e.class}: #{e.message}")
       []
     end
 
@@ -1512,6 +1771,52 @@ after_initialize do
     end
 
     # ============================================================
+    # Prefer-digest-list: eligible HARDSALE set inside digest list (NEW)
+    # ============================================================
+    def self.eligible_hardsale_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
+      return [Set.new, 0, 0, [], false] if user.nil?
+      return [Set.new, 0, 0, [], false] if tag_ids.blank?
+      return [Set.new, 0, 0, [], false] if digest_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      watched_ids = watched_category_ids_for_user_hardsale(user)
+      watched_filter_applied = watched_ids.present?
+
+      scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_ids, topic_id: digest_ids })
+          .distinct
+
+      scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      if ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest? && created_after.present?
+        scope = scope.where("topics.created_at > ?", created_after)
+      end
+
+      candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
+      candidate_pool_count = candidate_ids.length
+      return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
+
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .pluck(:id)
+          .map(&:to_i)
+
+      visible_pool_count = visible_ids.length
+      return [Set.new, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
+
+      [visible_ids.to_set, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] eligible_hardsale_set_within_digest_list failed: #{e.class}: #{e.message}")
+      [Set.new, 0, 0, [], false]
+    end
+
+    # ============================================================
     # Prefer-digest-list: swap eligible promos into target indices
     # ============================================================
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
@@ -1678,6 +1983,64 @@ after_initialize do
       [[], 0, 0, [], false]
     end
 
+    # ============================================================
+    # Global picker (forum-wide) HARDSALE (NEW)
+    # ============================================================
+    def self.pick_random_hardsale_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
+      return [[], 0, 0, [], false] if limit.to_i <= 0
+      return [[], 0, 0, [], false] if tag_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      watched_ids = watched_category_ids_for_user_hardsale(user)
+      watched_filter_applied = watched_ids.present?
+
+      topic_tag_scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_ids })
+          .where.not(topic_tags: { topic_id: exclude_ids })
+          .distinct
+
+      topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+
+      if ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest? && created_after.present?
+        topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
+      end
+
+      scan_cap = ::PromoDigestSettings.hardsale_candidate_scan_cap
+
+      candidate_ids =
+        topic_tag_scope
+          .limit(scan_cap)
+          .pluck("topic_tags.topic_id")
+          .map(&:to_i)
+          .uniq
+
+      candidate_pool_count = candidate_ids.length
+      return [[], candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
+
+      candidate_ids = candidate_ids.shuffle
+
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: candidate_ids)
+          .where.not(id: exclude_ids)
+          .pluck(:id)
+          .map(&:to_i)
+
+      visible_pool_count = visible_ids.length
+      return [[], candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied] if visible_ids.blank?
+
+      picked = visible_ids.sample([limit.to_i, visible_ids.length].min)
+      [picked, candidate_pool_count, visible_pool_count, watched_ids, watched_filter_applied]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] pick_random_hardsale_topic_ids failed: #{e.class}: #{e.message}")
+      [[], 0, 0, [], false]
+    end
+
     def self.build_ordered_relation(user, ids)
       return Topic.none if ids.blank?
 
@@ -1795,6 +2158,27 @@ after_initialize do
       superpromo_created_after_enabled:,
       superpromo_created_after_applied:,
 
+      # -------- HARDSALE (NEW) --------
+      hardsale_tag:,
+      hardsale_tag_ids:,
+      hardsale_injected_ids:,
+      hardsale_attempted_replace:,
+      hardsale_replace_indices:,
+      hardsale_is_skipped_hastag:,
+      hardsale_is_skipped_coinflip:,
+      hardsale_candidate_pool_count:,
+      hardsale_visible_pool_count:,
+      hardsale_watched_category_ids:,
+      hardsale_watched_filter_applied:,
+      hardsale_pick_mode:,
+      hardsale_digest_list_candidates_count:,
+      hardsale_digest_list_visible_count:,
+      hardsale_digest_list_picked:,
+      hardsale_fallback_picked:,
+      hardsale_used_fallback_outside_digest:,
+      hardsale_created_after_enabled:,
+      hardsale_created_after_applied:,
+
       debug_digest_build_uuid:,
       debug_for_digest_call_index:,
       debug_for_digest_since:,
@@ -1892,7 +2276,6 @@ after_initialize do
           injected_topic_ids: injected_ids,
           replaced_indices: replaced_indices,
 
-          # NEW: record switch state in debug so your PHP table can see it
           regular_injection_enabled: ::PromoDigestSettings.regular_injection_enabled?,
 
           superpromo: {
@@ -1917,6 +2300,30 @@ after_initialize do
             fallback_picked: superpromo_fallback_picked,
             created_after_last_digest_filter_enabled: superpromo_created_after_enabled,
             created_after_last_digest_filter_applied: superpromo_created_after_applied
+          },
+
+          hardsale: {
+            enabled: ::PromoDigestSettings.hardsale_enabled?,
+            tag: hardsale_tag,
+            tag_ids: hardsale_tag_ids,
+            injected_topic_ids: hardsale_injected_ids,
+            attempted_replace: hardsale_attempted_replace,
+            replaced_indices: hardsale_replace_indices,
+            is_skipped_hastag: hardsale_is_skipped_hastag,
+            is_skipped_coinflip: hardsale_is_skipped_coinflip,
+            candidate_pool_count: hardsale_candidate_pool_count,
+            visible_pool_count: hardsale_visible_pool_count,
+            watched_category_ids: hardsale_watched_category_ids,
+            watched_categories_mode: ::PromoDigestSettings.hardsale_use_watched_categories?,
+            watched_filter_applied: hardsale_watched_filter_applied,
+            pick_mode: hardsale_pick_mode,
+            digest_list_candidates_count: hardsale_digest_list_candidates_count,
+            digest_list_visible_count: hardsale_digest_list_visible_count,
+            digest_list_picked: hardsale_digest_list_picked,
+            used_fallback_outside_digest: hardsale_used_fallback_outside_digest,
+            fallback_picked: hardsale_fallback_picked,
+            created_after_last_digest_filter_enabled: hardsale_created_after_enabled,
+            created_after_last_digest_filter_applied: hardsale_created_after_applied
           }
         }
       }
