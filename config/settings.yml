@@ -347,3 +347,12 @@ plugins:
   promo_digest_injector_debug_include_opts:
     default: true
     client: false
+
+  promo_digest_injector_push_specific_enabled:
+    default: false
+    client: false
+
+  promo_digest_injector_push_specific_topic_id:
+    default: 0
+    client: false
+    type: integer    
