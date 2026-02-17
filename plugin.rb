@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.5.0
+# version: 1.6.0
 # authors: you
 
 after_initialize do
@@ -26,6 +26,25 @@ after_initialize do
     # (superpromo/hardsale remain independent)
     def self.regular_injection_enabled?
       SiteSetting.promo_digest_injector_regular_enabled == true
+    end
+
+    # ============================================================
+    # NEW: PUSH SPECIFIC (HARD OVERRIDE)
+    # If enabled + valid topic id, digest will ONLY contain that topic
+    # and ALL other logic is skipped.
+    # ============================================================
+    def self.push_specific_enabled?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_enabled)
+      SiteSetting.promo_digest_injector_push_specific_enabled == true
+    rescue
+      false
+    end
+
+    def self.push_specific_topic_id
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_topic_id)
+      SiteSetting.promo_digest_injector_push_specific_topic_id.to_i
+    rescue
+      0
     end
 
     def self.min_digests_before_inject
@@ -717,6 +736,158 @@ after_initialize do
       return original_relation if user.nil?
 
       limit = extract_limit(opts)
+
+      # ---------- DEBUG CONTEXT ----------
+      digest_build_uuid = Thread.current[:promo_digest_build_uuid]
+      for_digest_call_index = Thread.current[:promo_digest_for_digest_call_index]
+      for_digest_since = Thread.current[:promo_digest_since]
+      for_digest_opts_sanitized = Thread.current[:promo_digest_opts_sanitized]
+      for_digest_callsite = Thread.current[:promo_digest_callsite]
+
+      since_key = for_digest_since.respond_to?(:to_i) ? for_digest_since.to_i : 0
+      debug_dedupe_key = "u#{user.id}-s#{since_key}-l#{limit}"
+
+      # ============================================================
+      # NEW: PUSH SPECIFIC OVERRIDE
+      # If enabled + valid topic_id (and visible), the digest will ONLY contain that topic.
+      # Skip ALL other injections/swaps/checks.
+      # ============================================================
+      push_enabled = ::PromoDigestSettings.push_specific_enabled?
+      push_tid = ::PromoDigestSettings.push_specific_topic_id.to_i
+      push_applied = false
+
+      if push_enabled && push_tid > 0
+        guardian = Guardian.new(user)
+        visible = Topic.visible.secured(guardian).where(id: push_tid).limit(1).exists?
+
+        if visible
+          push_applied = true
+
+          final_ids = [push_tid]
+          original_ids = [push_tid]
+          tagged_ids_in_original = []
+          injected_ids = []
+
+          # Persist FINAL digest contents (the forced single topic)
+          persist_last_digest_topics(user, final_ids)
+          persist_last_digest_first_topic(user, final_ids.first)
+
+          # Send summary (still send, but minimal + flags)
+          enqueue_summary_post(
+            user: user,
+
+            promo_tag: "",
+            promo_tag_found: false,
+            promo_tag_id: nil,
+            promo_tag_total_topics: 0,
+            promo_tag_ids: [],
+            promo_tag_names: [],
+            first_injected_tag_name: nil,
+
+            original_ids: original_ids,
+            tagged_ids_in_original: tagged_ids_in_original,
+            injected_ids: injected_ids,
+            final_ids: final_ids,
+
+            original_topics_matched_tags: {},
+            injected_topics_matched_tags: {},
+
+            is_skipped_haspromo: false,
+            is_skipped_coinflip: false,
+            is_skipped_min_digests: false,
+            min_digests_required: ::PromoDigestSettings.min_digests_before_inject,
+            user_digest_count: 0,
+            replaced_indices: [],
+            attempted_replace: false,
+            candidate_pool_count: 0,
+            visible_pool_count: 0,
+            watched_category_ids: [],
+            watched_filter_applied: false,
+            forced_first_applied: false,
+            first_topic_id_before_force: push_tid,
+            first_topic_id_after_force: push_tid,
+            first_topic_was_watched_before_force: false,
+            first_topic_was_watched_after_force: false,
+            last_digest_sent_at: last_digest_sent_at_for_user(user),
+            created_after_last_digest_filter_enabled: ::PromoDigestSettings.filter_promo_topics_created_after_last_digest?,
+            created_after_last_digest_filter_applied: false,
+            promo_pick_mode: ::PromoDigestSettings.promo_pick_mode,
+            digest_list_candidates_count: 0,
+            digest_list_visible_count: 0,
+            digest_list_picked: [],
+            fallback_picked: [],
+            used_fallback_outside_digest: false,
+            user_watched_category_ids: watched_category_ids_for_user(user),
+
+            no_watched_shuffle_enabled: ::PromoDigestSettings.shuffle_topics_if_no_watched_categories?,
+            no_watched_shuffle_applied: false,
+            no_watched_shuffle_top_n: ::PromoDigestSettings.shuffle_topics_if_no_watched_top_n,
+            no_watched_shuffle_coinflip_percent: ::PromoDigestSettings.shuffle_topics_if_no_watched_coinflip_percent,
+
+            watched_percent_enforcer_applied: false,
+            watched_percent_debug: {},
+
+            superpromo_tag: "",
+            superpromo_tag_ids: [],
+            superpromo_injected_ids: [],
+            superpromo_attempted_replace: false,
+            superpromo_replace_indices: [],
+            superpromo_is_skipped_hastag: false,
+            superpromo_is_skipped_coinflip: false,
+            superpromo_candidate_pool_count: 0,
+            superpromo_visible_pool_count: 0,
+            superpromo_watched_category_ids: [],
+            superpromo_watched_filter_applied: false,
+            superpromo_pick_mode: ::PromoDigestSettings.superpromo_pick_mode,
+            superpromo_digest_list_candidates_count: 0,
+            superpromo_digest_list_visible_count: 0,
+            superpromo_digest_list_picked: [],
+            superpromo_fallback_picked: [],
+            superpromo_used_fallback_outside_digest: false,
+            superpromo_created_after_enabled: ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?,
+            superpromo_created_after_applied: false,
+
+            hardsale_tag: "",
+            hardsale_tag_ids: [],
+            hardsale_injected_ids: [],
+            hardsale_attempted_replace: false,
+            hardsale_replace_indices: [],
+            hardsale_is_skipped_hastag: false,
+            hardsale_is_skipped_coinflip: false,
+            hardsale_candidate_pool_count: 0,
+            hardsale_visible_pool_count: 0,
+            hardsale_watched_category_ids: [],
+            hardsale_watched_filter_applied: false,
+            hardsale_pick_mode: ::PromoDigestSettings.hardsale_pick_mode,
+            hardsale_digest_list_candidates_count: 0,
+            hardsale_digest_list_visible_count: 0,
+            hardsale_digest_list_picked: [],
+            hardsale_fallback_picked: [],
+            hardsale_used_fallback_outside_digest: false,
+            hardsale_created_after_enabled: ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest?,
+            hardsale_created_after_applied: false,
+
+            debug_digest_build_uuid: digest_build_uuid,
+            debug_for_digest_call_index: for_digest_call_index,
+            debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
+            debug_for_digest_opts: for_digest_opts_sanitized,
+            debug_for_digest_callsite: for_digest_callsite,
+            debug_dedupe_key: debug_dedupe_key,
+
+            # NEW
+            push_specific_enabled: push_enabled,
+            push_specific_topic_id: push_tid,
+            push_specific_applied: push_applied
+          )
+
+          return build_ordered_relation(user, final_ids)
+        end
+        # If not visible: do NOT override; fall through to normal behavior.
+      end
+
+      # ------------------------------------------------------------
+      # Normal flow (existing behavior)
+      # ------------------------------------------------------------
       original_ids = original_relation.limit(limit).pluck(:id)
       original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
 
@@ -739,16 +910,6 @@ after_initialize do
       hardsale_tag_ids = hardsale_tag_models.map(&:id).compact.uniq
 
       user_watched_category_ids = watched_category_ids_for_user(user)
-
-      # ---------- DEBUG CONTEXT ----------
-      digest_build_uuid = Thread.current[:promo_digest_build_uuid]
-      for_digest_call_index = Thread.current[:promo_digest_for_digest_call_index]
-      for_digest_since = Thread.current[:promo_digest_since]
-      for_digest_opts_sanitized = Thread.current[:promo_digest_opts_sanitized]
-      for_digest_callsite = Thread.current[:promo_digest_callsite]
-
-      since_key = for_digest_since.respond_to?(:to_i) ? for_digest_since.to_i : 0
-      debug_dedupe_key = "u#{user.id}-s#{since_key}-l#{limit}"
 
       # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
       min_digests_required = ::PromoDigestSettings.min_digests_before_inject
@@ -985,8 +1146,8 @@ after_initialize do
       # SUPERPROMO injection block (runs SECOND, independent)
       # ============================================================
       if ::PromoDigestSettings.superpromo_enabled? &&
-   !is_skipped_min_digests &&
-   final_ids.present? && superpromo_tag_ids.present?
+         !is_skipped_min_digests &&
+         final_ids.present? && superpromo_tag_ids.present?
 
         superpromo_tagged_ids_set =
           begin
@@ -1116,9 +1277,9 @@ after_initialize do
       # ============================================================
       # HARDSALE injection block (runs THIRD, independent, after superpromo)
       # ============================================================
-if ::PromoDigestSettings.hardsale_enabled? &&
-   !is_skipped_min_digests &&
-   final_ids.present? && hardsale_tag_ids.present?
+      if ::PromoDigestSettings.hardsale_enabled? &&
+         !is_skipped_min_digests &&
+         final_ids.present? && hardsale_tag_ids.present?
 
         hardsale_tagged_ids_set =
           begin
@@ -1417,7 +1578,12 @@ if ::PromoDigestSettings.hardsale_enabled? &&
         debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
         debug_for_digest_opts: for_digest_opts_sanitized,
         debug_for_digest_callsite: for_digest_callsite,
-        debug_dedupe_key: debug_dedupe_key
+        debug_dedupe_key: debug_dedupe_key,
+
+        # NEW
+        push_specific_enabled: push_enabled,
+        push_specific_topic_id: push_tid,
+        push_specific_applied: push_applied
       )
 
       return original_relation if final_ids.blank?
@@ -2190,7 +2356,12 @@ if ::PromoDigestSettings.hardsale_enabled? &&
       debug_for_digest_since:,
       debug_for_digest_opts:,
       debug_for_digest_callsite:,
-      debug_dedupe_key:
+      debug_dedupe_key:,
+
+      # -------- PUSH SPECIFIC (NEW) --------
+      push_specific_enabled:,
+      push_specific_topic_id:,
+      push_specific_applied:
     )
       endpoint = ::PromoDigestSettings.endpoint_url
       return if endpoint.empty?
@@ -2231,6 +2402,13 @@ if ::PromoDigestSettings.hardsale_enabled? &&
           for_digest_opts: debug_for_digest_opts,
           for_digest_callsite: debug_for_digest_callsite,
           debug_dedupe_key: debug_dedupe_key,
+
+          # NEW
+          push_specific: {
+            enabled: push_specific_enabled,
+            topic_id: push_specific_topic_id,
+            applied: push_specific_applied
+          },
 
           promo_tag_found: promo_tag_found,
           promo_tag_id: promo_tag_id,
