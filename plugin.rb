@@ -22,20 +22,24 @@ after_initialize do
       SiteSetting.promo_digest_injector_enabled == true
     end
 
-    # NEW: independent master switch for REGULAR promo injection only
+    # Independent master switch for REGULAR promo injection only
     # (superpromo/hardsale remain independent)
     def self.regular_injection_enabled?
       SiteSetting.promo_digest_injector_regular_enabled == true
     end
 
     # ============================================================
-    # PUSH SPECIFIC (HARD OVERRIDE)
-    # If enabled + passes coinflip + topic selected, digest will ONLY contain that topic
-    # and ALL other logic is skipped.
+    # PUSH SPECIFIC (HARD OVERRIDE) + DYNAMIC PICKER
     #
-    # Can be driven by:
-    #  (A) fixed topic id (push_specific_topic_id)
-    #  (B) dynamic picker (push_specific_dynamic_enabled)
+    # If enabled, push logic MAY override the digest to contain ONLY ONE topic,
+    # depending on:
+    #  - (optional) "recent push digest" cooldown gate
+    #  - coinflip apply percent
+    #  - source:
+    #      (1) explicit topic id via settings
+    #      (2) dynamic picker (A1/A2/B stages)
+    #
+    # If push is applied: ALL other injection/swaps are skipped.
     # ============================================================
     def self.push_specific_enabled?
       return false unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_enabled)
@@ -51,15 +55,10 @@ after_initialize do
       0
     end
 
-    # NEW: coinflip percent for whether push override is attempted at all (0..100).
-    # Default 100 (matches historical "push always when enabled").
+    # Coinflip percent to apply push flow (0..100). If 0 => never, 100 => always (subject to other gates).
     def self.push_specific_apply_percent
-      v =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_apply_percent)
-          SiteSetting.promo_digest_injector_push_specific_apply_percent.to_i
-        else
-          100
-        end
+      return 100 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_apply_percent)
+      v = SiteSetting.promo_digest_injector_push_specific_apply_percent.to_i
       v = 0 if v < 0
       v = 100 if v > 100
       v
@@ -67,7 +66,23 @@ after_initialize do
       100
     end
 
-    # NEW: if enabled, choose topic dynamically instead of fixed ID
+    # Optional pre-gate: if user received ANY push-type digest within last X days, skip push entirely (before coinflip).
+    def self.push_specific_skip_if_recent_push_enabled?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_skip_if_recent_push_enabled)
+      SiteSetting.promo_digest_injector_push_specific_skip_if_recent_push_enabled == true
+    rescue
+      false
+    end
+
+    def self.push_specific_skip_if_recent_push_days
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_skip_if_recent_push_days)
+      v = SiteSetting.promo_digest_injector_push_specific_skip_if_recent_push_days.to_i
+      v < 0 ? 0 : v
+    rescue
+      0
+    end
+
+    # Dynamic picker enable
     def self.push_specific_dynamic_enabled?
       return false unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_enabled)
       SiteSetting.promo_digest_injector_push_specific_dynamic_enabled == true
@@ -75,20 +90,18 @@ after_initialize do
       false
     end
 
-    # NEW: dynamic tags (pipe-separated), defaults to "verified"
+    # Dynamic picker tags (pipe-separated), eg: "verified|featured"
     def self.push_specific_dynamic_tags
-      raw =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_tags)
-          SiteSetting.promo_digest_injector_push_specific_dynamic_tags.to_s
-        else
-          "verified"
-        end
-      raw.split("|").map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+      return ["verified"] unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_tags)
+      raw = SiteSetting.promo_digest_injector_push_specific_dynamic_tags.to_s
+      tags = raw.split("|").map { |t| t.to_s.strip.downcase }.reject(&:empty?).uniq
+      tags = ["verified"] if tags.blank?
+      tags
     rescue
       ["verified"]
     end
 
-    # NEW: dynamic picker optionally requires created_after_last_digest
+    # Dynamic: require created_after_last_digest (optional)
     def self.push_specific_dynamic_require_created_after_last_digest?
       return false unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_require_created_after_last_digest)
       SiteSetting.promo_digest_injector_push_specific_dynamic_require_created_after_last_digest == true
@@ -96,34 +109,25 @@ after_initialize do
       false
     end
 
-    # NEW: dynamic picker lookahead extra (stage A2)
+    # Dynamic Stage A2: lookahead extra beyond digest limit
     def self.push_specific_dynamic_lookahead_extra
-      v =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_lookahead_extra)
-          SiteSetting.promo_digest_injector_push_specific_dynamic_lookahead_extra.to_i
-        else
-          50
-        end
+      return 50 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_lookahead_extra)
+      v = SiteSetting.promo_digest_injector_push_specific_dynamic_lookahead_extra.to_i
       v < 0 ? 0 : v
     rescue
       50
     end
 
-    # NEW: dynamic forum scan cap (stage B)
+    # Dynamic Stage B: forum scan cap
     def self.push_specific_dynamic_forum_scan_cap
-      v =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_forum_scan_cap)
-          SiteSetting.promo_digest_injector_push_specific_dynamic_forum_scan_cap.to_i
-        else
-          500
-        end
+      return 500 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_dynamic_forum_scan_cap)
+      v = SiteSetting.promo_digest_injector_push_specific_dynamic_forum_scan_cap.to_i
       v <= 0 ? 500 : v
     rescue
       500
     end
 
-    # NEW: filter out topics pushed recently (dynamic picker)
-    # Default true (because requirement: always filter out last X days, optional switch)
+    # Exclude topics pushed recently (per-user history) when using dynamic picker
     def self.push_specific_exclude_recent_pushed?
       return true unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_exclude_recent_pushed)
       SiteSetting.promo_digest_injector_push_specific_exclude_recent_pushed == true
@@ -131,43 +135,31 @@ after_initialize do
       true
     end
 
-    # NEW: recent pushed days window
     def self.push_specific_exclude_recent_pushed_days
-      v =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_exclude_recent_pushed_days)
-          SiteSetting.promo_digest_injector_push_specific_exclude_recent_pushed_days.to_i
-        else
-          30
-        end
-      v = 0 if v < 0
-      v
+      return 30 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_exclude_recent_pushed_days)
+      v = SiteSetting.promo_digest_injector_push_specific_exclude_recent_pushed_days.to_i
+      v < 0 ? 0 : v
     rescue
       30
     end
 
-    # NEW: pushed history custom field key (stores last N pushes with datetime/topic/category/title_prefix)
+    # Push history custom field (JSON array of objects)
     def self.push_specific_pushed_history_field
-      if SiteSetting.respond_to?(:promo_digest_injector_push_specific_pushed_history_field)
-        v = SiteSetting.promo_digest_injector_push_specific_pushed_history_field.to_s.strip
-        return v if v != ""
-      end
-      "promo_digest_pushed_topics_last50"
+      return "promo_digest_pushed_topics_last50" unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_pushed_history_field)
+      SiteSetting.promo_digest_injector_push_specific_pushed_history_field.to_s.strip
     rescue
       "promo_digest_pushed_topics_last50"
     end
 
     def self.push_specific_pushed_history_max
-      v =
-        if SiteSetting.respond_to?(:promo_digest_injector_push_specific_pushed_history_max)
-          SiteSetting.promo_digest_injector_push_specific_pushed_history_max.to_i
-        else
-          50
-        end
+      return 50 unless SiteSetting.respond_to?(:promo_digest_injector_push_specific_pushed_history_max)
+      v = SiteSetting.promo_digest_injector_push_specific_pushed_history_max.to_i
       v <= 0 ? 50 : v
     rescue
       50
     end
 
+    # ---------------- Existing settings ----------------
     def self.min_digests_before_inject
       v = SiteSetting.promo_digest_injector_min_digests_before_inject.to_i
       v < 0 ? 0 : v
@@ -553,6 +545,131 @@ after_initialize do
       nil
     end
 
+    # ============================================================
+    # PUSH HISTORY (per-user) helpers
+    # Stored in user.custom_fields[push_history_field] as JSON array:
+    #   [{ "ts":"2026-02-18T12:34:56Z", "topic_id":123, "category_id":9, "title":"first 50 chars" }, ...]
+    # Newest first. Duplicates allowed.
+    # ============================================================
+    def self.push_history_field
+      ::PromoDigestSettings.push_specific_pushed_history_field
+    end
+
+    def self.push_history_max
+      ::PromoDigestSettings.push_specific_pushed_history_max
+    end
+
+    def self.read_push_history_entries(user)
+      return [] if user.nil?
+      field = push_history_field
+      return [] if field.blank?
+
+      raw = user.custom_fields[field].to_s
+      arr =
+        begin
+          JSON.parse(raw)
+        rescue
+          []
+        end
+      arr = Array(arr)
+      arr.select { |x| x.is_a?(Hash) }
+    rescue
+      []
+    end
+
+    def self.push_received_within_days?(user, days)
+      return false if user.nil?
+      d = days.to_i
+      return false if d <= 0
+
+      cutoff = Time.now.utc - (d * 24 * 60 * 60)
+      read_push_history_entries(user).any? do |h|
+        ts = h["ts"] || h[:ts]
+        next false if ts.blank?
+        t =
+          begin
+            Time.parse(ts.to_s).utc
+          rescue
+            nil
+          end
+        t.present? && t >= cutoff
+      end
+    rescue
+      false
+    end
+
+    def self.pushed_topic_ids_within_days(user, days)
+      return Set.new if user.nil?
+      d = days.to_i
+      return Set.new if d <= 0
+
+      cutoff = Time.now.utc - (d * 24 * 60 * 60)
+
+      out = Set.new
+      read_push_history_entries(user).each do |h|
+        ts = h["ts"] || h[:ts]
+        tid = (h["topic_id"] || h[:topic_id]).to_i
+        next if tid <= 0 || ts.blank?
+
+        t =
+          begin
+            Time.parse(ts.to_s).utc
+          rescue
+            nil
+          end
+        next if t.nil? || t < cutoff
+
+        out.add(tid)
+      end
+      out
+    rescue
+      Set.new
+    end
+
+    def self.persist_pushed_topic_history(user, topic_id)
+      return if user.nil?
+      tid = topic_id.to_i
+      return if tid <= 0
+
+      field = push_history_field
+      return if field.blank?
+
+      max_n = push_history_max
+      now_iso = Time.now.utc.iso8601
+
+      row = Topic.where(id: tid).pluck(:category_id, :title).first
+      category_id = row ? row[0].to_i : 0
+      title = row ? row[1].to_s : ""
+      title50 = title.to_s[0, 50]
+
+      entry = {
+        "ts" => now_iso,
+        "topic_id" => tid,
+        "category_id" => category_id,
+        "title" => title50
+      }
+
+      User.transaction do
+        u = User.lock.find(user.id)
+
+        prev_raw = u.custom_fields[field].to_s
+        prev =
+          begin
+            JSON.parse(prev_raw)
+          rescue
+            []
+          end
+        prev = Array(prev).select { |x| x.is_a?(Hash) }
+
+        combined = ([entry] + prev).first(max_n)
+
+        u.custom_fields[field] = combined.to_json
+        u.save_custom_fields(true)
+      end
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] persist_pushed_topic_history failed: #{e.class}: #{e.message}")
+    end
+
     # ----------------------------
     # Store last N FINAL digest topics (newest first, duplicates allowed)
     # ----------------------------
@@ -625,128 +742,6 @@ after_initialize do
       Rails.logger.warn("[#{PLUGIN_NAME}] persist_last_digest_first_topic failed: #{e.class}: #{e.message}")
     end
 
-    # ============================================================
-    # NEW: PUSHED HISTORY (last N pushes with datetime/topic/category/title_prefix)
-    # ============================================================
-    def self.push_history_field
-      ::PromoDigestSettings.push_specific_pushed_history_field.to_s.strip
-    rescue
-      "promo_digest_pushed_topics_last50"
-    end
-
-    def self.push_history_max
-      ::PromoDigestSettings.push_specific_pushed_history_max.to_i
-    rescue
-      50
-    end
-
-    def self.normalize_title_prefix(title, max_chars = 50)
-      s = title.to_s
-      s = s.gsub(/\s+/, " ").strip
-      s = s[0, max_chars] if s.length > max_chars
-      s
-    rescue
-      ""
-    end
-
-    def self.read_push_history_entries(user)
-      return [] if user.nil?
-      field = push_history_field
-      return [] if field == ""
-
-      raw = user.custom_fields[field].to_s
-      return [] if raw.strip == ""
-
-      parsed =
-        begin
-          JSON.parse(raw)
-        rescue
-          []
-        end
-      Array(parsed)
-    rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] read_push_history_entries failed: #{e.class}: #{e.message}")
-      []
-    end
-
-    def self.recent_pushed_topic_ids(user, days)
-      return Set.new if user.nil?
-      d = days.to_i
-      return Set.new if d <= 0
-
-      entries = read_push_history_entries(user)
-      return Set.new if entries.blank?
-
-      cutoff = Time.now.utc - (d * 86_400)
-
-      out = Set.new
-      entries.each do |row|
-        next unless row.is_a?(Hash)
-        ts_s = row["datetime_utc"] || row["datetime"] || row["ts"]
-        tid = row["topic_id"] || row["tid"] || row["id"]
-        next if tid.to_i <= 0
-        next if ts_s.to_s.strip == ""
-
-        ts =
-          begin
-            Time.parse(ts_s.to_s).utc
-          rescue
-            nil
-          end
-        next if ts.nil?
-        next if ts < cutoff
-
-        out.add(tid.to_i)
-      end
-      out
-    rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] recent_pushed_topic_ids failed: #{e.class}: #{e.message}")
-      Set.new
-    end
-
-    def self.persist_pushed_topic_history(user, topic_id)
-      return if user.nil?
-      field = push_history_field
-      return if field == ""
-
-      tid = topic_id.to_i
-      return if tid <= 0
-
-      max_n = push_history_max
-      max_n = 50 if max_n <= 0
-
-      row = Topic.where(id: tid).pluck(:id, :category_id, :title).first
-      return if row.blank?
-
-      _id, category_id, title = row
-      entry = {
-        "datetime_utc" => Time.now.utc.iso8601,
-        "topic_id" => tid,
-        "category_id" => category_id.to_i,
-        "title_prefix" => normalize_title_prefix(title, 50)
-      }
-
-      User.transaction do
-        u = User.lock.find(user.id)
-
-        prev_raw = u.custom_fields[field].to_s
-        prev =
-          begin
-            JSON.parse(prev_raw)
-          rescue
-            []
-          end
-        prev = Array(prev).select { |x| x.is_a?(Hash) }
-
-        combined = ([entry] + prev).first(max_n)
-
-        u.custom_fields[field] = combined.to_json
-        u.save_custom_fields(true)
-      end
-    rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] persist_pushed_topic_history failed: #{e.class}: #{e.message}")
-    end
-
     # ----------------------------
     # helper to indicate whether current first topic is from watched category
     # ----------------------------
@@ -781,199 +776,6 @@ after_initialize do
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] topic_has_any_tag? failed: #{e.class}: #{e.message}")
       false
-    end
-
-    # ============================================================
-    # NEW: PUSH DYNAMIC PICKER (Stage A1, A2, B)
-    #
-    # - Stage A1: scan digest main ids (within limit)
-    # - Stage A2: scan lookahead extra ids (limit + lookahead_extra, drop first limit)
-    # - Stage B:  forum-wide scan (watched categories only)
-    #
-    # If multiple candidates in a stage: random pick among them.
-    # ============================================================
-    def self.pick_dynamic_push_topic(user, original_relation, limit:, last_digest_sent_at:)
-      return [0, nil, {}] if user.nil?
-      return [0, nil, {}] if original_relation.blank?
-
-      tag_names = ::PromoDigestSettings.push_specific_dynamic_tags
-      tags = Array(tag_names).map { |t| find_tag_by_name_ci(t) }.compact
-      tag_ids = tags.map(&:id).compact.uniq
-      return [0, nil, { error: "no_dynamic_tags_found", tag_names: tag_names }] if tag_ids.blank?
-
-      # MUST be from user's watched categories (not gated by promo_digest_injector_use_watched_categories)
-      watched_ids =
-        begin
-          levels = []
-          if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
-            nl = CategoryUser.notification_levels
-            levels << (nl[:watching] || 3)
-            levels << (nl[:watching_first_post] || 4) if ::PromoDigestSettings.include_watching_first_post?
-          else
-            levels = ::PromoDigestSettings.include_watching_first_post? ? [3, 4] : [3]
-          end
-          CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
-        rescue
-          []
-        end
-
-      watched_ids = Array(watched_ids).map(&:to_i).reject(&:zero?).uniq
-      return [0, nil, { error: "no_watched_categories" }] if watched_ids.blank?
-
-      require_created_after = ::PromoDigestSettings.push_specific_dynamic_require_created_after_last_digest?
-      created_after_applied = (require_created_after && last_digest_sent_at.present?)
-
-      exclude_recent_enabled = ::PromoDigestSettings.push_specific_exclude_recent_pushed?
-      exclude_recent_days = ::PromoDigestSettings.push_specific_exclude_recent_pushed_days
-      recent_ids_set =
-        if exclude_recent_enabled && exclude_recent_days.to_i > 0
-          recent_pushed_topic_ids(user, exclude_recent_days.to_i)
-        else
-          Set.new
-        end
-
-      guardian = Guardian.new(user)
-
-      # -------- Stage A1: digest main list (within limit) --------
-      digest_main_ids =
-        begin
-          original_relation.limit(limit.to_i).pluck(:id).map(&:to_i).reject(&:zero?)
-        rescue
-          []
-        end
-
-      a1_candidates = []
-      if digest_main_ids.present?
-        scope =
-          Topic
-            .visible
-            .secured(guardian)
-            .where(id: digest_main_ids, category_id: watched_ids)
-            .joins(:topic_tags)
-            .where(topic_tags: { tag_id: tag_ids })
-            .distinct
-
-        scope = scope.where("topics.created_at > ?", last_digest_sent_at) if created_after_applied
-        scope = scope.where.not(id: recent_ids_set.to_a) if recent_ids_set.present?
-
-        a1_candidates = scope.pluck(:id).map(&:to_i).reject(&:zero?)
-      end
-
-      if a1_candidates.present?
-        return [
-          a1_candidates.sample.to_i,
-          "A1_digest_main",
-          {
-            tag_names: tag_names,
-            tag_ids: tag_ids,
-            watched_category_ids: watched_ids,
-            require_created_after_last_digest: require_created_after,
-            created_after_applied: created_after_applied,
-            exclude_recent_pushed_enabled: exclude_recent_enabled,
-            exclude_recent_pushed_days: exclude_recent_days,
-            recent_excluded_count: recent_ids_set.length,
-            candidates_count: a1_candidates.length
-          }
-        ]
-      end
-
-      # -------- Stage A2: digest lookahead extras (beyond limit) --------
-      lookahead_extra = ::PromoDigestSettings.push_specific_dynamic_lookahead_extra.to_i
-      a2_candidates = []
-
-      if lookahead_extra > 0
-        raw =
-          begin
-            original_relation.limit(limit.to_i + lookahead_extra).pluck(:id).map(&:to_i).reject(&:zero?)
-          rescue
-            []
-          end
-        extra_ids = raw.drop(limit.to_i)
-        extra_ids = extra_ids.reject(&:zero?)
-        extra_ids = extra_ids - digest_main_ids
-
-        if extra_ids.present?
-          scope =
-            Topic
-              .visible
-              .secured(guardian)
-              .where(id: extra_ids, category_id: watched_ids)
-              .joins(:topic_tags)
-              .where(topic_tags: { tag_id: tag_ids })
-              .distinct
-
-          scope = scope.where("topics.created_at > ?", last_digest_sent_at) if created_after_applied
-          scope = scope.where.not(id: recent_ids_set.to_a) if recent_ids_set.present?
-
-          a2_candidates = scope.pluck(:id).map(&:to_i).reject(&:zero?)
-        end
-      end
-
-      if a2_candidates.present?
-        return [
-          a2_candidates.sample.to_i,
-          "A2_digest_lookahead",
-          {
-            tag_names: tag_names,
-            tag_ids: tag_ids,
-            watched_category_ids: watched_ids,
-            require_created_after_last_digest: require_created_after,
-            created_after_applied: created_after_applied,
-            exclude_recent_pushed_enabled: exclude_recent_enabled,
-            exclude_recent_pushed_days: exclude_recent_days,
-            recent_excluded_count: recent_ids_set.length,
-            lookahead_extra: lookahead_extra,
-            candidates_count: a2_candidates.length
-          }
-        ]
-      end
-
-      # -------- Stage B: forum-wide scan fallback --------
-      scan_cap = ::PromoDigestSettings.push_specific_dynamic_forum_scan_cap.to_i
-      scan_cap = 500 if scan_cap <= 0
-
-      scope =
-        Topic
-          .visible
-          .secured(guardian)
-          .where(category_id: watched_ids)
-          .joins(:topic_tags)
-          .where(topic_tags: { tag_id: tag_ids })
-          .distinct
-
-      scope = scope.where("topics.created_at > ?", last_digest_sent_at) if created_after_applied
-      scope = scope.where.not(id: recent_ids_set.to_a) if recent_ids_set.present?
-
-      # prefer newest, but user asked: "random between them" -> we randomize among the returned pool
-      b_candidates =
-        scope
-          .order(created_at: :desc, id: :desc)
-          .limit(scan_cap)
-          .pluck(:id)
-          .map(&:to_i)
-          .reject(&:zero?)
-
-      return [0, "B_forum_scan", { candidates_count: 0 }] if b_candidates.blank?
-
-      [
-        b_candidates.sample.to_i,
-        "B_forum_scan",
-        {
-          tag_names: tag_names,
-          tag_ids: tag_ids,
-          watched_category_ids: watched_ids,
-          require_created_after_last_digest: require_created_after,
-          created_after_applied: created_after_applied,
-          exclude_recent_pushed_enabled: exclude_recent_enabled,
-          exclude_recent_pushed_days: exclude_recent_days,
-          recent_excluded_count: recent_ids_set.length,
-          scan_cap: scan_cap,
-          candidates_count: b_candidates.length
-        }
-      ]
-    rescue => e
-      Rails.logger.warn("[#{PLUGIN_NAME}] pick_dynamic_push_topic failed: #{e.class}: #{e.message}")
-      [0, nil, { error: "#{e.class}: #{e.message}" }]
     end
 
     # ============================================================
@@ -1163,6 +965,181 @@ after_initialize do
       nil
     end
 
+    # ============================================================
+    # PUSH DYNAMIC PICKER (A1/A2/B)
+    # A1: candidates within the digest list (first limit)
+    # A2: candidates within lookahead extra beyond limit
+    # B : forum-wide scan within watched categories
+    #
+    # If a stage yields multiple candidates, pick RANDOM among them.
+    # ============================================================
+    def self.pick_dynamic_push_topic_id(user, base_relation, limit:, last_digest_sent_at:)
+      return [nil, nil, {}] if user.nil?
+      return [nil, nil, {}] if base_relation.blank?
+
+      tags = ::PromoDigestSettings.push_specific_dynamic_tags
+      tag_models = tags.map { |t| find_tag_by_name_ci(t) }.compact
+      tag_ids = tag_models.map(&:id).compact.uniq
+      return [nil, nil, { dynamic_tags: tags, stage: nil, candidates: {} }] if tag_ids.blank?
+
+      guardian = Guardian.new(user)
+
+      # Always use ACTUAL watched categories for dynamic push (spec says "from the user's watched categories")
+      watched_ids = watched_category_ids_for_user_always(user)
+      return [nil, nil, { dynamic_tags: tags, stage: nil, candidates: {}, watched_category_ids: [] }] if watched_ids.blank?
+
+      created_after_required = ::PromoDigestSettings.push_specific_dynamic_require_created_after_last_digest?
+      created_after = (created_after_required ? last_digest_sent_at : nil)
+
+      # Exclude topics pushed recently (optional)
+      exclude_recent = ::PromoDigestSettings.push_specific_exclude_recent_pushed?
+      exclude_days = ::PromoDigestSettings.push_specific_exclude_recent_pushed_days
+      exclude_set = (exclude_recent && exclude_days.to_i > 0) ? pushed_topic_ids_within_days(user, exclude_days) : Set.new
+
+      debug = {
+        dynamic_tags: tags,
+        tag_ids: tag_ids,
+        watched_category_ids: watched_ids,
+        created_after_required: created_after_required,
+        created_after_ts: (created_after.present? ? created_after.utc.iso8601 : nil),
+        exclude_recent_pushed_enabled: exclude_recent,
+        exclude_recent_pushed_days: exclude_days,
+        excluded_recent_topic_ids_count: exclude_set.length,
+        stage: nil,
+        candidates: { a1: 0, a2: 0, b: 0 }
+      }
+
+      # Stage A1: within digest list (first limit)
+      a1_ids =
+        base_relation
+          .limit(limit.to_i)
+          .pluck(:id)
+          .map(&:to_i)
+          .reject(&:zero?)
+
+      a1_candidates = eligible_tagged_candidates_in_ids(
+        user,
+        guardian,
+        ids: a1_ids,
+        tag_ids: tag_ids,
+        watched_category_ids: watched_ids,
+        created_after: created_after,
+        exclude_ids_set: exclude_set
+      )
+      debug[:candidates][:a1] = a1_candidates.length
+
+      if a1_candidates.present?
+        debug[:stage] = "A1"
+        return [a1_candidates.sample, "dynamic_A1", debug]
+      end
+
+      # Stage A2: lookahead beyond limit
+      extra = ::PromoDigestSettings.push_specific_dynamic_lookahead_extra
+      if extra.to_i > 0
+        a2_full =
+          base_relation
+            .limit(limit.to_i + extra.to_i)
+            .pluck(:id)
+            .map(&:to_i)
+            .reject(&:zero?)
+
+        a2_ids = a2_full.drop(limit.to_i)
+        a2_candidates = eligible_tagged_candidates_in_ids(
+          user,
+          guardian,
+          ids: a2_ids,
+          tag_ids: tag_ids,
+          watched_category_ids: watched_ids,
+          created_after: created_after,
+          exclude_ids_set: exclude_set
+        )
+        debug[:candidates][:a2] = a2_candidates.length
+
+        if a2_candidates.present?
+          debug[:stage] = "A2"
+          return [a2_candidates.sample, "dynamic_A2", debug]
+        end
+      end
+
+      # Stage B: forum-wide scan
+      scan_cap = ::PromoDigestSettings.push_specific_dynamic_forum_scan_cap
+
+      scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { tag_id: tag_ids })
+          .where(topics: { category_id: watched_ids })
+          .distinct
+
+      scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
+      scope = scope.where.not(topic_tags: { topic_id: exclude_set.to_a }) if exclude_set.present?
+
+      cand_ids =
+        scope
+          .limit(scan_cap)
+          .pluck("topic_tags.topic_id")
+          .map(&:to_i)
+          .uniq
+
+      # Ensure visible
+      visible_ids =
+        Topic
+          .visible
+          .secured(guardian)
+          .where(id: cand_ids)
+          .pluck(:id)
+          .map(&:to_i)
+
+      debug[:candidates][:b] = visible_ids.length
+
+      if visible_ids.present?
+        debug[:stage] = "B"
+        return [visible_ids.sample, "dynamic_B", debug]
+      end
+
+      [nil, nil, debug]
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] pick_dynamic_push_topic_id failed: #{e.class}: #{e.message}")
+      [nil, nil, {}]
+    end
+
+    def self.eligible_tagged_candidates_in_ids(user, guardian, ids:, tag_ids:, watched_category_ids:, created_after:, exclude_ids_set:)
+      return [] if user.nil?
+      return [] if guardian.nil?
+      ids2 = Array(ids).map(&:to_i).reject(&:zero?).uniq
+      return [] if ids2.blank?
+      t_ids = Array(tag_ids).map(&:to_i).reject(&:zero?).uniq
+      return [] if t_ids.blank?
+      cids = Array(watched_category_ids).map(&:to_i).reject(&:zero?).uniq
+      return [] if cids.blank?
+
+      scope =
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { topic_id: ids2, tag_id: t_ids })
+          .where(topics: { category_id: cids })
+          .distinct
+
+      scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
+
+      cand_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
+      return [] if cand_ids.blank?
+
+      if exclude_ids_set.present?
+        cand_ids = cand_ids.reject { |tid| exclude_ids_set.include?(tid) }
+      end
+      return [] if cand_ids.blank?
+
+      Topic
+        .visible
+        .secured(guardian)
+        .where(id: cand_ids)
+        .pluck(:id)
+        .map(&:to_i)
+    rescue
+      []
+    end
+
     # ----------------------------
     # Main hook
     # ----------------------------
@@ -1184,188 +1161,226 @@ after_initialize do
       debug_dedupe_key = "u#{user.id}-s#{since_key}-l#{limit}"
 
       # ============================================================
-      # PUSH SPECIFIC OVERRIDE (coinflip + fixed OR dynamic)
-      # If applied + visible topic, digest will ONLY contain that topic,
-      # and we return immediately (no other injections/swaps/enforcers).
+      # Min-digests gate computed EARLY (applies to push + injections)
       # ============================================================
-      push_enabled = ::PromoDigestSettings.push_specific_enabled?
-      push_apply_percent = ::PromoDigestSettings.push_specific_apply_percent
-      push_dynamic_enabled = ::PromoDigestSettings.push_specific_dynamic_enabled?
-
-      push_tid_fixed = ::PromoDigestSettings.push_specific_topic_id.to_i
-      push_tid_selected = 0
-      push_stage = nil
-      push_picker_debug = {}
-      push_coinflip_passed = false
-      push_applied = false
-
-      if push_enabled
-        # coinflip gating
-        if push_apply_percent >= 100
-          push_coinflip_passed = true
-        elsif push_apply_percent <= 0
-          push_coinflip_passed = false
-        else
-          push_coinflip_passed = (rand(100) < push_apply_percent)
-        end
+      min_digests_required = ::PromoDigestSettings.min_digests_before_inject
+      user_digest_count_val = 0
+      is_skipped_min_digests = false
+      if min_digests_required > 0
+        user_digest_count_val = user_digest_count(user)
+        is_skipped_min_digests = (user_digest_count_val < min_digests_required)
       end
 
       last_digest_sent_at = last_digest_sent_at_for_user(user)
 
-      if push_enabled && push_coinflip_passed
-        if push_dynamic_enabled
-          push_tid_selected, push_stage, push_picker_debug =
-            pick_dynamic_push_topic(
-              user,
-              original_relation,
-              limit: limit,
-              last_digest_sent_at: last_digest_sent_at
-            )
+      # ============================================================
+      # PUSH OVERRIDE FLOW
+      # ============================================================
+      push_enabled = ::PromoDigestSettings.push_specific_enabled?
+      push_tid_setting = ::PromoDigestSettings.push_specific_topic_id.to_i
+
+      push_apply_percent = ::PromoDigestSettings.push_specific_apply_percent
+      push_coinflip_passed = false
+
+      push_cooldown_enabled = ::PromoDigestSettings.push_specific_skip_if_recent_push_enabled?
+      push_cooldown_days = ::PromoDigestSettings.push_specific_skip_if_recent_push_days
+      push_cooldown_blocked = false
+
+      push_dynamic_enabled = ::PromoDigestSettings.push_specific_dynamic_enabled?
+      push_dynamic_tags = ::PromoDigestSettings.push_specific_dynamic_tags
+
+      push_applied = false
+      push_source = nil
+      push_selected_topic_id = nil
+      push_dynamic_debug = {}
+
+      push_skip_reason = nil
+
+      if push_enabled
+        # Respect the min-digests requirement (same as injections)
+        if is_skipped_min_digests
+          push_skip_reason = "min_digests_gate"
         else
-          push_tid_selected = push_tid_fixed
-          push_stage = "fixed_topic_id"
-          push_picker_debug = {}
-        end
-
-        if push_tid_selected.to_i > 0
-          guardian = Guardian.new(user)
-          visible = Topic.visible.secured(guardian).where(id: push_tid_selected.to_i).limit(1).exists?
-
-          if visible
-            push_applied = true
-
-            final_ids = [push_tid_selected.to_i]
-            original_ids = [push_tid_selected.to_i]
-            tagged_ids_in_original = []
-            injected_ids = []
-
-            # Persist FINAL digest contents (forced single topic)
-            persist_last_digest_topics(user, final_ids)
-            persist_last_digest_first_topic(user, final_ids.first)
-
-            # NEW: persist pushed-topic history
-            persist_pushed_topic_history(user, push_tid_selected.to_i)
-
-            enqueue_summary_post(
-              user: user,
-
-              promo_tag: "",
-              promo_tag_found: false,
-              promo_tag_id: nil,
-              promo_tag_total_topics: 0,
-              promo_tag_ids: [],
-              promo_tag_names: [],
-              first_injected_tag_name: nil,
-
-              original_ids: original_ids,
-              tagged_ids_in_original: tagged_ids_in_original,
-              injected_ids: injected_ids,
-              final_ids: final_ids,
-
-              original_topics_matched_tags: {},
-              injected_topics_matched_tags: {},
-
-              is_skipped_haspromo: false,
-              is_skipped_coinflip: false,
-              is_skipped_min_digests: false,
-              min_digests_required: ::PromoDigestSettings.min_digests_before_inject,
-              user_digest_count: 0,
-              replaced_indices: [],
-              attempted_replace: false,
-              candidate_pool_count: 0,
-              visible_pool_count: 0,
-              watched_category_ids: [],
-              watched_filter_applied: false,
-              forced_first_applied: false,
-              first_topic_id_before_force: push_tid_selected.to_i,
-              first_topic_id_after_force: push_tid_selected.to_i,
-              first_topic_was_watched_before_force: false,
-              first_topic_was_watched_after_force: false,
-              last_digest_sent_at: last_digest_sent_at,
-              created_after_last_digest_filter_enabled: ::PromoDigestSettings.filter_promo_topics_created_after_last_digest?,
-              created_after_last_digest_filter_applied: false,
-              promo_pick_mode: ::PromoDigestSettings.promo_pick_mode,
-              digest_list_candidates_count: 0,
-              digest_list_visible_count: 0,
-              digest_list_picked: [],
-              fallback_picked: [],
-              used_fallback_outside_digest: false,
-              user_watched_category_ids: watched_category_ids_for_user(user),
-
-              no_watched_shuffle_enabled: ::PromoDigestSettings.shuffle_topics_if_no_watched_categories?,
-              no_watched_shuffle_applied: false,
-              no_watched_shuffle_top_n: ::PromoDigestSettings.shuffle_topics_if_no_watched_top_n,
-              no_watched_shuffle_coinflip_percent: ::PromoDigestSettings.shuffle_topics_if_no_watched_coinflip_percent,
-
-              watched_percent_enforcer_applied: false,
-              watched_percent_debug: {},
-
-              superpromo_tag: "",
-              superpromo_tag_ids: [],
-              superpromo_injected_ids: [],
-              superpromo_attempted_replace: false,
-              superpromo_replace_indices: [],
-              superpromo_is_skipped_hastag: false,
-              superpromo_is_skipped_coinflip: false,
-              superpromo_candidate_pool_count: 0,
-              superpromo_visible_pool_count: 0,
-              superpromo_watched_category_ids: [],
-              superpromo_watched_filter_applied: false,
-              superpromo_pick_mode: ::PromoDigestSettings.superpromo_pick_mode,
-              superpromo_digest_list_candidates_count: 0,
-              superpromo_digest_list_visible_count: 0,
-              superpromo_digest_list_picked: [],
-              superpromo_fallback_picked: [],
-              superpromo_used_fallback_outside_digest: false,
-              superpromo_created_after_enabled: ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?,
-              superpromo_created_after_applied: false,
-
-              hardsale_tag: "",
-              hardsale_tag_ids: [],
-              hardsale_injected_ids: [],
-              hardsale_attempted_replace: false,
-              hardsale_replace_indices: [],
-              hardsale_is_skipped_hastag: false,
-              hardsale_is_skipped_coinflip: false,
-              hardsale_candidate_pool_count: 0,
-              hardsale_visible_pool_count: 0,
-              hardsale_watched_category_ids: [],
-              hardsale_watched_filter_applied: false,
-              hardsale_pick_mode: ::PromoDigestSettings.hardsale_pick_mode,
-              hardsale_digest_list_candidates_count: 0,
-              hardsale_digest_list_visible_count: 0,
-              hardsale_digest_list_picked: [],
-              hardsale_fallback_picked: [],
-              hardsale_used_fallback_outside_digest: false,
-              hardsale_created_after_enabled: ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest?,
-              hardsale_created_after_applied: false,
-
-              debug_digest_build_uuid: digest_build_uuid,
-              debug_for_digest_call_index: for_digest_call_index,
-              debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
-              debug_for_digest_opts: for_digest_opts_sanitized,
-              debug_for_digest_callsite: for_digest_callsite,
-              debug_dedupe_key: debug_dedupe_key,
-
-              # PUSH (existing)
-              push_specific_enabled: push_enabled,
-              push_specific_topic_id: push_tid_selected.to_i,
-              push_specific_applied: push_applied,
-
-              # PUSH (new debug)
-              push_specific_apply_percent: push_apply_percent,
-              push_specific_coinflip_passed: push_coinflip_passed,
-              push_specific_dynamic_enabled: push_dynamic_enabled,
-              push_specific_dynamic_stage: push_stage,
-              push_specific_dynamic_picker_debug: push_picker_debug,
-              push_specific_pushed_history_field: push_history_field
-            )
-
-            return build_ordered_relation(user, final_ids)
+          # Optional cooldown gate (runs BEFORE coinflip)
+          if push_cooldown_enabled && push_cooldown_days.to_i > 0
+            if push_received_within_days?(user, push_cooldown_days)
+              push_cooldown_blocked = true
+              push_skip_reason = "recent_push_cooldown"
+            end
           end
-          # If not visible: fall through to normal behavior.
+
+          if !push_cooldown_blocked
+            if push_apply_percent.to_i <= 0
+              push_skip_reason = "coinflip"
+            else
+              push_coinflip_passed = (push_apply_percent.to_i >= 100) || (rand(100) < push_apply_percent.to_i)
+              if !push_coinflip_passed
+                push_skip_reason = "coinflip"
+              else
+                # (1) Explicit topic id via settings
+                if push_tid_setting > 0
+                  guardian = Guardian.new(user)
+                  visible = Topic.visible.secured(guardian).where(id: push_tid_setting).limit(1).exists?
+                  if visible
+                    push_selected_topic_id = push_tid_setting
+                    push_source = "settings_topic_id"
+                  end
+                end
+
+                # (2) Dynamic picker (if no explicit visible topic id)
+                if push_selected_topic_id.nil? && push_dynamic_enabled
+                  picked_id, src, dyn_debug =
+                    pick_dynamic_push_topic_id(
+                      user,
+                      original_relation,
+                      limit: limit,
+                      last_digest_sent_at: last_digest_sent_at
+                    )
+                  if picked_id.to_i > 0
+                    push_selected_topic_id = picked_id.to_i
+                    push_source = src
+                    push_dynamic_debug = dyn_debug || {}
+                  end
+                end
+
+                if push_selected_topic_id.to_i > 0
+                  push_applied = true
+
+                  final_ids = [push_selected_topic_id.to_i]
+                  original_ids = original_relation.limit(limit).pluck(:id).map(&:to_i).reject(&:zero?)
+
+                  # Persist FINAL digest contents (forced single topic)
+                  persist_last_digest_topics(user, final_ids)
+                  persist_last_digest_first_topic(user, final_ids.first)
+
+                  # Persist PUSH history (new field)
+                  persist_pushed_topic_history(user, final_ids.first)
+
+                  # Send summary (minimal topic info)
+                  enqueue_summary_post(
+                    user: user,
+
+                    promo_tag: "",
+                    promo_tag_found: false,
+                    promo_tag_id: nil,
+                    promo_tag_total_topics: 0,
+                    promo_tag_ids: [],
+                    promo_tag_names: [],
+                    first_injected_tag_name: nil,
+
+                    original_ids: original_ids,
+                    tagged_ids_in_original: [],
+                    injected_ids: [],
+                    final_ids: final_ids,
+
+                    original_topics_matched_tags: {},
+                    injected_topics_matched_tags: {},
+
+                    is_skipped_haspromo: false,
+                    is_skipped_coinflip: false,
+                    is_skipped_min_digests: is_skipped_min_digests,
+                    min_digests_required: min_digests_required,
+                    user_digest_count: user_digest_count_val,
+                    replaced_indices: [],
+                    attempted_replace: false,
+                    candidate_pool_count: 0,
+                    visible_pool_count: 0,
+                    watched_category_ids: [],
+                    watched_filter_applied: false,
+                    forced_first_applied: false,
+                    first_topic_id_before_force: final_ids.first,
+                    first_topic_id_after_force: final_ids.first,
+                    first_topic_was_watched_before_force: false,
+                    first_topic_was_watched_after_force: false,
+                    last_digest_sent_at: last_digest_sent_at,
+                    created_after_last_digest_filter_enabled: ::PromoDigestSettings.filter_promo_topics_created_after_last_digest?,
+                    created_after_last_digest_filter_applied: false,
+                    promo_pick_mode: ::PromoDigestSettings.promo_pick_mode,
+                    digest_list_candidates_count: 0,
+                    digest_list_visible_count: 0,
+                    digest_list_picked: [],
+                    fallback_picked: [],
+                    used_fallback_outside_digest: false,
+                    user_watched_category_ids: watched_category_ids_for_user(user),
+
+                    no_watched_shuffle_enabled: ::PromoDigestSettings.shuffle_topics_if_no_watched_categories?,
+                    no_watched_shuffle_applied: false,
+                    no_watched_shuffle_top_n: ::PromoDigestSettings.shuffle_topics_if_no_watched_top_n,
+                    no_watched_shuffle_coinflip_percent: ::PromoDigestSettings.shuffle_topics_if_no_watched_coinflip_percent,
+
+                    watched_percent_enforcer_applied: false,
+                    watched_percent_debug: {},
+
+                    superpromo_tag: "",
+                    superpromo_tag_ids: [],
+                    superpromo_injected_ids: [],
+                    superpromo_attempted_replace: false,
+                    superpromo_replace_indices: [],
+                    superpromo_is_skipped_hastag: false,
+                    superpromo_is_skipped_coinflip: false,
+                    superpromo_candidate_pool_count: 0,
+                    superpromo_visible_pool_count: 0,
+                    superpromo_watched_category_ids: [],
+                    superpromo_watched_filter_applied: false,
+                    superpromo_pick_mode: ::PromoDigestSettings.superpromo_pick_mode,
+                    superpromo_digest_list_candidates_count: 0,
+                    superpromo_digest_list_visible_count: 0,
+                    superpromo_digest_list_picked: [],
+                    superpromo_fallback_picked: [],
+                    superpromo_used_fallback_outside_digest: false,
+                    superpromo_created_after_enabled: ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?,
+                    superpromo_created_after_applied: false,
+
+                    hardsale_tag: "",
+                    hardsale_tag_ids: [],
+                    hardsale_injected_ids: [],
+                    hardsale_attempted_replace: false,
+                    hardsale_replace_indices: [],
+                    hardsale_is_skipped_hastag: false,
+                    hardsale_is_skipped_coinflip: false,
+                    hardsale_candidate_pool_count: 0,
+                    hardsale_visible_pool_count: 0,
+                    hardsale_watched_category_ids: [],
+                    hardsale_watched_filter_applied: false,
+                    hardsale_pick_mode: ::PromoDigestSettings.hardsale_pick_mode,
+                    hardsale_digest_list_candidates_count: 0,
+                    hardsale_digest_list_visible_count: 0,
+                    hardsale_digest_list_picked: [],
+                    hardsale_fallback_picked: [],
+                    hardsale_used_fallback_outside_digest: false,
+                    hardsale_created_after_enabled: ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest?,
+                    hardsale_created_after_applied: false,
+
+                    debug_digest_build_uuid: digest_build_uuid,
+                    debug_for_digest_call_index: for_digest_call_index,
+                    debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
+                    debug_for_digest_opts: for_digest_opts_sanitized,
+                    debug_for_digest_callsite: for_digest_callsite,
+                    debug_dedupe_key: debug_dedupe_key,
+
+                    # PUSH DEBUG
+                    push_specific_enabled: push_enabled,
+                    push_specific_topic_id: push_tid_setting,
+                    push_specific_applied: push_applied,
+                    push_specific_source: push_source,
+                    push_specific_selected_topic_id: push_selected_topic_id,
+                    push_specific_apply_percent: push_apply_percent,
+                    push_specific_coinflip_passed: push_coinflip_passed,
+                    push_specific_skip_reason: push_skip_reason,
+                    push_specific_cooldown_enabled: push_cooldown_enabled,
+                    push_specific_cooldown_days: push_cooldown_days,
+                    push_specific_cooldown_blocked: push_cooldown_blocked,
+                    push_specific_dynamic_enabled: push_dynamic_enabled,
+                    push_specific_dynamic_tags: push_dynamic_tags,
+                    push_specific_dynamic_debug: push_dynamic_debug
+                  )
+
+                  return build_ordered_relation(user, final_ids)
+                end
+              end
+            end
+          end
         end
-        # If no selection: fall through to normal behavior.
       end
 
       # ------------------------------------------------------------
@@ -1394,15 +1409,7 @@ after_initialize do
 
       user_watched_category_ids = watched_category_ids_for_user(user)
 
-      # ---------- GATE: do not return early; mark skipped + ALWAYS send report ----------
-      min_digests_required = ::PromoDigestSettings.min_digests_before_inject
-
-      user_digest_count_val = 0
-      is_skipped_min_digests = false
-      if min_digests_required > 0
-        user_digest_count_val = user_digest_count(user)
-        is_skipped_min_digests = (user_digest_count_val < min_digests_required)
-      end
+      # Gate already computed above: min_digests_required, user_digest_count_val, is_skipped_min_digests
 
       tagged_ids_set =
         if original_ids.present? && tag_ids.present?
@@ -1522,7 +1529,7 @@ after_initialize do
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
-      # ALSO gated by promo_digest_injector_regular_enabled
+      # Also gated by SiteSetting: promo_digest_injector_regular_enabled
       # ============================================================
       if ::PromoDigestSettings.regular_injection_enabled? &&
          !is_skipped_min_digests && !is_skipped_haspromo && original_ids.present? && tag_ids.present?
@@ -1625,7 +1632,7 @@ after_initialize do
       end
 
       # ============================================================
-      # SUPERPROMO injection block
+      # SUPERPROMO injection block (runs SECOND, independent)
       # ============================================================
       if ::PromoDigestSettings.superpromo_enabled? &&
          !is_skipped_min_digests &&
@@ -1675,7 +1682,7 @@ after_initialize do
                   eligible_superpromo_set_within_digest_list(
                     user,
                     tag_ids: superpromo_tag_ids,
-                    digest_ids: final_ids,
+                    digest_ids: final_ids, # operate on post-promo list
                     created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
                   )
 
@@ -1757,7 +1764,7 @@ after_initialize do
       end
 
       # ============================================================
-      # HARDSALE injection block
+      # HARDSALE injection block (runs THIRD, independent)
       # ============================================================
       if ::PromoDigestSettings.hardsale_enabled? &&
          !is_skipped_min_digests &&
@@ -1807,7 +1814,7 @@ after_initialize do
                   eligible_hardsale_set_within_digest_list(
                     user,
                     tag_ids: hardsale_tag_ids,
-                    digest_ids: final_ids,
+                    digest_ids: final_ids, # operate on post-promo+superpromo list
                     created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
                   )
 
@@ -1889,7 +1896,7 @@ after_initialize do
       end
 
       # ============================================================
-      # Enforce minimum % watched-category topics
+      # Enforce minimum % watched-category topics (AFTER injections)
       # ============================================================
       begin
         final_ids, watched_percent_enforcer_applied, watched_percent_debug, _ =
@@ -1905,7 +1912,7 @@ after_initialize do
       end
 
       # ============================================================
-      # Force first topic from watched categories
+      # Force first topic from watched categories (always evaluated)
       # ============================================================
       first_topic_id_before_force = (final_ids.present? ? final_ids.first.to_i : nil)
       first_topic_was_watched_before_force = first_topic_is_watched_category?(user, final_ids)
@@ -2062,16 +2069,21 @@ after_initialize do
         debug_for_digest_callsite: for_digest_callsite,
         debug_dedupe_key: debug_dedupe_key,
 
-        # PUSH flags (not applied here, but included for observability)
+        # PUSH DEBUG (even if not applied, for observability)
         push_specific_enabled: push_enabled,
-        push_specific_topic_id: push_tid_fixed,
+        push_specific_topic_id: push_tid_setting,
         push_specific_applied: false,
+        push_specific_source: push_source,
+        push_specific_selected_topic_id: push_selected_topic_id,
         push_specific_apply_percent: push_apply_percent,
         push_specific_coinflip_passed: push_coinflip_passed,
+        push_specific_skip_reason: push_skip_reason,
+        push_specific_cooldown_enabled: push_cooldown_enabled,
+        push_specific_cooldown_days: push_cooldown_days,
+        push_specific_cooldown_blocked: push_cooldown_blocked,
         push_specific_dynamic_enabled: push_dynamic_enabled,
-        push_specific_dynamic_stage: nil,
-        push_specific_dynamic_picker_debug: {},
-        push_specific_pushed_history_field: push_history_field
+        push_specific_dynamic_tags: push_dynamic_tags,
+        push_specific_dynamic_debug: push_dynamic_debug
       )
 
       return original_relation if final_ids.blank?
@@ -2155,24 +2167,36 @@ after_initialize do
     end
 
     # ---------- WATCHED CATEGORY HELPERS ----------
-    def self.watched_category_ids_for_user(user)
-      return [] unless ::PromoDigestSettings.use_watched_categories?
-      return [] if user.nil?
-
+    def self.notification_levels(include_first_post:)
       levels = []
       if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
         nl = CategoryUser.notification_levels
         levels << (nl[:watching] || 3)
-        if ::PromoDigestSettings.include_watching_first_post?
-          levels << (nl[:watching_first_post] || 4)
-        end
+        levels << (nl[:watching_first_post] || 4) if include_first_post
       else
-        levels = ::PromoDigestSettings.include_watching_first_post? ? [3, 4] : [3]
+        levels = include_first_post ? [3, 4] : [3]
       end
+      levels
+    end
 
+    # Respects main setting use_watched_categories?
+    def self.watched_category_ids_for_user(user)
+      return [] unless ::PromoDigestSettings.use_watched_categories?
+      return [] if user.nil?
+
+      levels = notification_levels(include_first_post: ::PromoDigestSettings.include_watching_first_post?)
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    # Always returns watched categories (ignores use_watched_categories? switch) — used by dynamic push picker.
+    def self.watched_category_ids_for_user_always(user)
+      return [] if user.nil?
+      levels = notification_levels(include_first_post: ::PromoDigestSettings.include_watching_first_post?)
+      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
+    rescue
       []
     end
 
@@ -2180,17 +2204,7 @@ after_initialize do
       return [] unless ::PromoDigestSettings.superpromo_use_watched_categories?
       return [] if user.nil?
 
-      levels = []
-      if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
-        nl = CategoryUser.notification_levels
-        levels << (nl[:watching] || 3)
-        if ::PromoDigestSettings.superpromo_include_watching_first_post?
-          levels << (nl[:watching_first_post] || 4)
-        end
-      else
-        levels = ::PromoDigestSettings.superpromo_include_watching_first_post? ? [3, 4] : [3]
-      end
-
+      levels = notification_levels(include_first_post: ::PromoDigestSettings.superpromo_include_watching_first_post?)
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user_superpromo failed: #{e.class}: #{e.message}")
@@ -2201,17 +2215,7 @@ after_initialize do
       return [] unless ::PromoDigestSettings.hardsale_use_watched_categories?
       return [] if user.nil?
 
-      levels = []
-      if defined?(CategoryUser) && CategoryUser.respond_to?(:notification_levels)
-        nl = CategoryUser.notification_levels
-        levels << (nl[:watching] || 3)
-        if ::PromoDigestSettings.hardsale_include_watching_first_post?
-          levels << (nl[:watching_first_post] || 4)
-        end
-      else
-        levels = ::PromoDigestSettings.hardsale_include_watching_first_post? ? [3, 4] : [3]
-      end
-
+      levels = notification_levels(include_first_post: ::PromoDigestSettings.hardsale_include_watching_first_post?)
       CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id)
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] watched_category_ids_for_user_hardsale failed: #{e.class}: #{e.message}")
@@ -2846,18 +2850,21 @@ after_initialize do
       debug_for_digest_callsite:,
       debug_dedupe_key:,
 
-      # -------- PUSH SPECIFIC --------
+      # -------- PUSH --------
       push_specific_enabled:,
       push_specific_topic_id:,
       push_specific_applied:,
-
-      # -------- PUSH SPECIFIC (new optional debug) --------
-      push_specific_apply_percent: nil,
-      push_specific_coinflip_passed: nil,
-      push_specific_dynamic_enabled: nil,
-      push_specific_dynamic_stage: nil,
-      push_specific_dynamic_picker_debug: nil,
-      push_specific_pushed_history_field: nil
+      push_specific_source:,
+      push_specific_selected_topic_id:,
+      push_specific_apply_percent:,
+      push_specific_coinflip_passed:,
+      push_specific_skip_reason:,
+      push_specific_cooldown_enabled:,
+      push_specific_cooldown_days:,
+      push_specific_cooldown_blocked:,
+      push_specific_dynamic_enabled:,
+      push_specific_dynamic_tags:,
+      push_specific_dynamic_debug:
     )
       endpoint = ::PromoDigestSettings.endpoint_url
       return if endpoint.empty?
@@ -2901,14 +2908,21 @@ after_initialize do
 
           push_specific: {
             enabled: push_specific_enabled,
+            settings_topic_id: push_specific_topic_id,
             applied: push_specific_applied,
-            topic_id: push_specific_topic_id,
+            source: push_specific_source,
+            selected_topic_id: push_specific_selected_topic_id,
             apply_percent: push_specific_apply_percent,
             coinflip_passed: push_specific_coinflip_passed,
+            skip_reason: push_specific_skip_reason,
+            cooldown_enabled: push_specific_cooldown_enabled,
+            cooldown_days: push_specific_cooldown_days,
+            cooldown_blocked: push_specific_cooldown_blocked,
             dynamic_enabled: push_specific_dynamic_enabled,
-            dynamic_stage: push_specific_dynamic_stage,
-            dynamic_picker_debug: push_specific_dynamic_picker_debug,
-            pushed_history_field: push_specific_pushed_history_field
+            dynamic_tags: push_specific_dynamic_tags,
+            dynamic_debug: push_specific_dynamic_debug,
+            pushed_history_field: ::PromoDigestSettings.push_specific_pushed_history_field,
+            pushed_history_max: ::PromoDigestSettings.push_specific_pushed_history_max
           },
 
           promo_tag_found: promo_tag_found,
