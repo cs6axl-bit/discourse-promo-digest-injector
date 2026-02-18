@@ -356,3 +356,72 @@ plugins:
     default: 0
     client: false
     type: integer    
+
+  promo_digest_injector_regular_enabled:
+    default: true
+    client: false
+    type: bool
+
+  # --- PUSH override: coinflip gating (0..100) ---
+  promo_digest_injector_push_specific_apply_percent:
+    default: 100
+    client: false
+    type: integer
+    min: 0
+    max: 100
+
+  # --- PUSH override: dynamic picker (Stage A1/A2/B) ---
+  promo_digest_injector_push_specific_dynamic_enabled:
+    default: false
+    client: false
+    type: bool
+
+  # Pipe-separated tag names, eg: "verified|featured"
+  promo_digest_injector_push_specific_dynamic_tags:
+    default: "verified"
+    client: false
+    type: string
+
+  promo_digest_injector_push_specific_dynamic_require_created_after_last_digest:
+    default: false
+    client: false
+    type: bool
+
+  # Stage A2: how many extra digest candidates beyond the normal limit to consider
+  promo_digest_injector_push_specific_dynamic_lookahead_extra:
+    default: 50
+    client: false
+    type: integer
+    min: 0
+
+  # Stage B: forum-wide fallback scan cap
+  promo_digest_injector_push_specific_dynamic_forum_scan_cap:
+    default: 500
+    client: false
+    type: integer
+    min: 1
+
+  # --- PUSH override: exclude topics that were "pushed" recently (per-user history) ---
+  promo_digest_injector_push_specific_exclude_recent_pushed:
+    default: true
+    client: false
+    type: bool
+
+  promo_digest_injector_push_specific_exclude_recent_pushed_days:
+    default: 30
+    client: false
+    type: integer
+    min: 0
+
+  # Where we store push history in user custom_fields (JSON array)
+  promo_digest_injector_push_specific_pushed_history_field:
+    default: "promo_digest_pushed_topics_last50"
+    client: false
+    type: string
+
+  promo_digest_injector_push_specific_pushed_history_max:
+    default: 50
+    client: false
+    type: integer
+    min: 1
+
