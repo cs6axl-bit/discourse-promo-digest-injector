@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.7.0
+# version: 1.7.1
 # authors: you
 
 after_initialize do
@@ -157,6 +157,45 @@ after_initialize do
       v <= 0 ? 50 : v
     rescue
       50
+    end
+
+    # ============================================================
+    # SUPERPUSH (NEW)
+    # If user watches ANY superpush categories, restrict push picks
+    # to the INTERSECTION (watched ∩ superpush_categories).
+    # If none watched, behave normally.
+    # ============================================================
+    def self.superpush_enabled?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_superpush_enabled)
+      SiteSetting.promo_digest_injector_superpush_enabled == true
+    rescue
+      false
+    end
+
+    # Coinflip percent to apply superpush restriction when user qualifies (0..100)
+    def self.superpush_apply_percent
+      return 100 unless SiteSetting.respond_to?(:promo_digest_injector_superpush_apply_percent)
+      v = SiteSetting.promo_digest_injector_superpush_apply_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    rescue
+      100
+    end
+
+    # Pipe-separated category IDs, e.g. "9|14|22"
+    def self.superpush_category_ids
+      return [] unless SiteSetting.respond_to?(:promo_digest_injector_superpush_category_ids)
+      raw = SiteSetting.promo_digest_injector_superpush_category_ids.to_s
+      raw
+        .split("|")
+        .map { |x| x.to_s.strip }
+        .reject(&:empty?)
+        .map { |x| x.to_i }
+        .reject(&:zero?)
+        .uniq
+    rescue
+      []
     end
 
     # ---------------- Existing settings ----------------
@@ -543,6 +582,68 @@ after_initialize do
       Rails.logger.warn("[#{PLUGIN_NAME}] last_digest_sent_at_for_user failed: #{e.class}: #{e.message}")
       Thread.current[cache_key] = nil
       nil
+    end
+
+    # ============================================================
+    # SUPERPUSH CONTEXT (NEW)
+    # Determines if superpush restriction is active for this user,
+    # and returns the watched categories to use for PUSH selection.
+    # ============================================================
+    def self.superpush_context_for_user(user, watched_ids_all)
+      watched_ids_all = Array(watched_ids_all).map(&:to_i).reject(&:zero?).uniq
+      sp_enabled = ::PromoDigestSettings.superpush_enabled?
+      sp_apply_pct = ::PromoDigestSettings.superpush_apply_percent
+      sp_cat_ids = ::PromoDigestSettings.superpush_category_ids
+
+      ctx = {
+        enabled: sp_enabled,
+        apply_percent: sp_apply_pct,
+        configured_category_ids: sp_cat_ids,
+        user_watched_all: watched_ids_all,
+        user_watched_superpush: [],
+        qualifies: false,
+        coinflip_passed: false,
+        active: false,
+        used_category_ids: watched_ids_all,
+        fallback_to_regular_due_to_no_candidates: false
+      }
+
+      return ctx if user.nil?
+      return ctx unless sp_enabled
+      return ctx if sp_cat_ids.blank?
+      return ctx if watched_ids_all.blank?
+
+      watched_super = watched_ids_all & sp_cat_ids
+      ctx[:user_watched_superpush] = watched_super
+      ctx[:qualifies] = watched_super.present?
+      return ctx unless ctx[:qualifies]
+
+      if sp_apply_pct.to_i <= 0
+        ctx[:coinflip_passed] = false
+        return ctx
+      end
+
+      ctx[:coinflip_passed] =
+        (sp_apply_pct.to_i >= 100) || (rand(100) < sp_apply_pct.to_i)
+
+      return ctx unless ctx[:coinflip_passed]
+
+      ctx[:active] = true
+      ctx[:used_category_ids] = watched_super
+      ctx
+    rescue
+      {
+        enabled: false,
+        apply_percent: 0,
+        configured_category_ids: [],
+        user_watched_all: Array(watched_ids_all).map(&:to_i).reject(&:zero?).uniq,
+        user_watched_superpush: [],
+        qualifies: false,
+        coinflip_passed: false,
+        active: false,
+        used_category_ids: Array(watched_ids_all).map(&:to_i).reject(&:zero?).uniq,
+        fallback_to_regular_due_to_no_candidates: false
+      }
     end
 
     # ============================================================
@@ -966,12 +1067,13 @@ after_initialize do
     end
 
     # ============================================================
-    # PUSH DYNAMIC PICKER (A1/A2/B)
-    # A1: candidates within the digest list (first limit)
-    # A2: candidates within lookahead extra beyond limit
-    # B : forum-wide scan within watched categories
+    # PUSH DYNAMIC PICKER (A1/A2/B) — UPDATED for SUPERPUSH
     #
-    # If a stage yields multiple candidates, pick RANDOM among them.
+    # If user watches any "superpush categories" and superpush coinflip passes:
+    #   - Restrict watched_category_ids to (watched ∩ superpush_categories)
+    #   - If no candidates found under that restriction => FALLBACK to regular watched logic
+    #
+    # If user does NOT watch any superpush categories => unchanged behavior.
     # ============================================================
     def self.pick_dynamic_push_topic_id(user, base_relation, limit:, last_digest_sent_at:)
       return [nil, nil, {}] if user.nil?
@@ -984,14 +1086,15 @@ after_initialize do
 
       guardian = Guardian.new(user)
 
-      # Always use ACTUAL watched categories for dynamic push (spec says "from the user's watched categories")
-      watched_ids = watched_category_ids_for_user_always(user)
-      return [nil, nil, { dynamic_tags: tags, stage: nil, candidates: {}, watched_category_ids: [] }] if watched_ids.blank?
+      watched_all = watched_category_ids_for_user_always(user)
+      return [nil, nil, { dynamic_tags: tags, stage: nil, candidates: {}, watched_category_ids: [] }] if watched_all.blank?
+
+      sp_ctx = superpush_context_for_user(user, watched_all)
+      watched_ids = sp_ctx[:used_category_ids]
 
       created_after_required = ::PromoDigestSettings.push_specific_dynamic_require_created_after_last_digest?
       created_after = (created_after_required ? last_digest_sent_at : nil)
 
-      # Exclude topics pushed recently (optional)
       exclude_recent = ::PromoDigestSettings.push_specific_exclude_recent_pushed?
       exclude_days = ::PromoDigestSettings.push_specific_exclude_recent_pushed_days
       exclude_set = (exclude_recent && exclude_days.to_i > 0) ? pushed_topic_ids_within_days(user, exclude_days) : Set.new
@@ -1000,6 +1103,8 @@ after_initialize do
         dynamic_tags: tags,
         tag_ids: tag_ids,
         watched_category_ids: watched_ids,
+        watched_category_ids_all: watched_all,
+        superpush: sp_ctx,
         created_after_required: created_after_required,
         created_after_ts: (created_after.present? ? created_after.utc.iso8601 : nil),
         exclude_recent_pushed_enabled: exclude_recent,
@@ -1009,92 +1114,110 @@ after_initialize do
         candidates: { a1: 0, a2: 0, b: 0 }
       }
 
-      # Stage A1: within digest list (first limit)
-      a1_ids =
-        base_relation
-          .limit(limit.to_i)
-          .pluck(:id)
-          .map(&:to_i)
-          .reject(&:zero?)
-
-      a1_candidates = eligible_tagged_candidates_in_ids(
-        user,
-        guardian,
-        ids: a1_ids,
-        tag_ids: tag_ids,
-        watched_category_ids: watched_ids,
-        created_after: created_after,
-        exclude_ids_set: exclude_set
-      )
-      debug[:candidates][:a1] = a1_candidates.length
-
-      if a1_candidates.present?
-        debug[:stage] = "A1"
-        return [a1_candidates.sample, "dynamic_A1", debug]
-      end
-
-      # Stage A2: lookahead beyond limit
-      extra = ::PromoDigestSettings.push_specific_dynamic_lookahead_extra
-      if extra.to_i > 0
-        a2_full =
+      picker_run = lambda do |watched_category_ids|
+        a1_ids =
           base_relation
-            .limit(limit.to_i + extra.to_i)
+            .limit(limit.to_i)
             .pluck(:id)
             .map(&:to_i)
             .reject(&:zero?)
 
-        a2_ids = a2_full.drop(limit.to_i)
-        a2_candidates = eligible_tagged_candidates_in_ids(
+        a1_candidates = eligible_tagged_candidates_in_ids(
           user,
           guardian,
-          ids: a2_ids,
+          ids: a1_ids,
           tag_ids: tag_ids,
-          watched_category_ids: watched_ids,
+          watched_category_ids: watched_category_ids,
           created_after: created_after,
           exclude_ids_set: exclude_set
         )
-        debug[:candidates][:a2] = a2_candidates.length
 
-        if a2_candidates.present?
-          debug[:stage] = "A2"
-          return [a2_candidates.sample, "dynamic_A2", debug]
+        if a1_candidates.present?
+          return [a1_candidates.sample, "dynamic_A1", { stage: "A1", cand_a1: a1_candidates.length }]
         end
+
+        extra = ::PromoDigestSettings.push_specific_dynamic_lookahead_extra
+        if extra.to_i > 0
+          a2_full =
+            base_relation
+              .limit(limit.to_i + extra.to_i)
+              .pluck(:id)
+              .map(&:to_i)
+              .reject(&:zero?)
+
+          a2_ids = a2_full.drop(limit.to_i)
+
+          a2_candidates = eligible_tagged_candidates_in_ids(
+            user,
+            guardian,
+            ids: a2_ids,
+            tag_ids: tag_ids,
+            watched_category_ids: watched_category_ids,
+            created_after: created_after,
+            exclude_ids_set: exclude_set
+          )
+
+          if a2_candidates.present?
+            return [a2_candidates.sample, "dynamic_A2", { stage: "A2", cand_a2: a2_candidates.length }]
+          end
+        end
+
+        scan_cap = ::PromoDigestSettings.push_specific_dynamic_forum_scan_cap
+
+        scope =
+          TopicTag
+            .joins(:topic)
+            .where(topic_tags: { tag_id: tag_ids })
+            .where(topics: { category_id: watched_category_ids })
+            .distinct
+
+        scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
+        scope = scope.where.not(topic_tags: { topic_id: exclude_set.to_a }) if exclude_set.present?
+
+        cand_ids =
+          scope
+            .limit(scan_cap)
+            .pluck("topic_tags.topic_id")
+            .map(&:to_i)
+            .uniq
+
+        visible_ids =
+          Topic
+            .visible
+            .secured(guardian)
+            .where(id: cand_ids)
+            .pluck(:id)
+            .map(&:to_i)
+
+        if visible_ids.present?
+          return [visible_ids.sample, "dynamic_B", { stage: "B", cand_b: visible_ids.length }]
+        end
+
+        [nil, nil, { stage: nil, cand_a1: 0, cand_a2: 0, cand_b: 0 }]
       end
 
-      # Stage B: forum-wide scan
-      scan_cap = ::PromoDigestSettings.push_specific_dynamic_forum_scan_cap
+      picked_id, src, mini = picker_run.call(watched_ids)
 
-      scope =
-        TopicTag
-          .joins(:topic)
-          .where(topic_tags: { tag_id: tag_ids })
-          .where(topics: { category_id: watched_ids })
-          .distinct
+      debug[:stage] = mini[:stage] if mini && mini[:stage]
+      if picked_id.to_i > 0
+        case mini[:stage]
+        when "A1" then debug[:candidates][:a1] = mini[:cand_a1].to_i
+        when "A2" then debug[:candidates][:a2] = mini[:cand_a2].to_i
+        when "B"  then debug[:candidates][:b]  = mini[:cand_b].to_i
+        end
+        return [picked_id.to_i, src, debug]
+      end
 
-      scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
-      scope = scope.where.not(topic_tags: { topic_id: exclude_set.to_a }) if exclude_set.present?
+      if sp_ctx[:active] && watched_all.present? && watched_all != watched_ids
+        sp_ctx[:fallback_to_regular_due_to_no_candidates] = true
+        debug[:superpush] = sp_ctx
 
-      cand_ids =
-        scope
-          .limit(scan_cap)
-          .pluck("topic_tags.topic_id")
-          .map(&:to_i)
-          .uniq
-
-      # Ensure visible
-      visible_ids =
-        Topic
-          .visible
-          .secured(guardian)
-          .where(id: cand_ids)
-          .pluck(:id)
-          .map(&:to_i)
-
-      debug[:candidates][:b] = visible_ids.length
-
-      if visible_ids.present?
-        debug[:stage] = "B"
-        return [visible_ids.sample, "dynamic_B", debug]
+        picked2, src2, mini2 = picker_run.call(watched_all)
+        if picked2.to_i > 0
+          debug[:watched_category_ids] = watched_all
+          debug[:stage] = mini2[:stage] if mini2 && mini2[:stage]
+          return [picked2.to_i, "#{src2}_superpush_fallback", debug]
+        end
       end
 
       [nil, nil, debug]
@@ -1197,11 +1320,9 @@ after_initialize do
       push_skip_reason = nil
 
       if push_enabled
-        # Respect the min-digests requirement (same as injections)
         if is_skipped_min_digests
           push_skip_reason = "min_digests_gate"
         else
-          # Optional cooldown gate (runs BEFORE coinflip)
           if push_cooldown_enabled && push_cooldown_days.to_i > 0
             if push_received_within_days?(user, push_cooldown_days)
               push_cooldown_blocked = true
@@ -1217,13 +1338,41 @@ after_initialize do
               if !push_coinflip_passed
                 push_skip_reason = "coinflip"
               else
-                # (1) Explicit topic id via settings
+                # (1) Explicit topic id via settings (SUPERPUSH-aware)
                 if push_tid_setting > 0
                   guardian = Guardian.new(user)
-                  visible = Topic.visible.secured(guardian).where(id: push_tid_setting).limit(1).exists?
-                  if visible
-                    push_selected_topic_id = push_tid_setting
-                    push_source = "settings_topic_id"
+
+                  watched_all_for_push = watched_category_ids_for_user_always(user)
+                  sp_ctx = superpush_context_for_user(user, watched_all_for_push)
+                  sp_active = sp_ctx[:active]
+                  sp_watched_ids = sp_ctx[:used_category_ids]
+
+                  row =
+                    Topic
+                      .visible
+                      .secured(guardian)
+                      .where(id: push_tid_setting)
+                      .limit(1)
+                      .pluck(:id, :category_id)
+                      .first
+
+                  if row
+                    tid = row[0].to_i
+                    cid = row[1].to_i
+
+                    if sp_active
+                      if sp_watched_ids.present? && sp_watched_ids.include?(cid)
+                        push_selected_topic_id = tid
+                        push_source = "settings_topic_id_superpush"
+                        push_dynamic_debug ||= {}
+                        push_dynamic_debug["superpush"] = sp_ctx
+                      end
+                    else
+                      push_selected_topic_id = tid
+                      push_source = "settings_topic_id"
+                      push_dynamic_debug ||= {}
+                      push_dynamic_debug["superpush"] = sp_ctx if sp_ctx.present?
+                    end
                   end
                 end
 
@@ -1249,14 +1398,10 @@ after_initialize do
                   final_ids = [push_selected_topic_id.to_i]
                   original_ids = original_relation.limit(limit).pluck(:id).map(&:to_i).reject(&:zero?)
 
-                  # Persist FINAL digest contents (forced single topic)
                   persist_last_digest_topics(user, final_ids)
                   persist_last_digest_first_topic(user, final_ids.first)
-
-                  # Persist PUSH history (new field)
                   persist_pushed_topic_history(user, final_ids.first)
 
-                  # Send summary (minimal topic info)
                   enqueue_summary_post(
                     user: user,
 
@@ -1358,7 +1503,6 @@ after_initialize do
                     debug_for_digest_callsite: for_digest_callsite,
                     debug_dedupe_key: debug_dedupe_key,
 
-                    # PUSH DEBUG
                     push_specific_enabled: push_enabled,
                     push_specific_topic_id: push_tid_setting,
                     push_specific_applied: push_applied,
@@ -1384,7 +1528,7 @@ after_initialize do
       end
 
       # ------------------------------------------------------------
-      # Normal flow (existing behavior)
+      # Normal flow (existing behavior) — UNCHANGED FROM YOUR FILE
       # ------------------------------------------------------------
       original_ids = original_relation.limit(limit).pluck(:id)
       original_ids = Array(original_ids).map(&:to_i).reject(&:zero?)
@@ -1395,21 +1539,17 @@ after_initialize do
       tags = promo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       tag_ids = tags.map(&:id).compact.uniq
 
-      # SUPERPROMO tags (independent pipeline)
       superpromo_tags = ::PromoDigestSettings.superpromo_tags
       superpromo_tag_for_payload = superpromo_tags.join(", ")
       superpromo_tag_models = superpromo_tags.map { |t| find_tag_by_name_ci(t) }.compact
       superpromo_tag_ids = superpromo_tag_models.map(&:id).compact.uniq
 
-      # HARDSALE tags (independent pipeline)
       hardsale_tags = ::PromoDigestSettings.hardsale_tags
       hardsale_tag_for_payload = hardsale_tags.join(", ")
       hardsale_tag_models = hardsale_tags.map { |t| find_tag_by_name_ci(t) }.compact
       hardsale_tag_ids = hardsale_tag_models.map(&:id).compact.uniq
 
       user_watched_category_ids = watched_category_ids_for_user(user)
-
-      # Gate already computed above: min_digests_required, user_digest_count_val, is_skipped_min_digests
 
       tagged_ids_set =
         if original_ids.present? && tag_ids.present?
@@ -1477,7 +1617,6 @@ after_initialize do
       watched_percent_enforcer_applied = false
       watched_percent_debug = {}
 
-      # -------- SUPERPROMO tracking vars --------
       superpromo_has_tagged_in_top = false
       superpromo_is_skipped_hastag = false
       superpromo_is_skipped_coinflip = false
@@ -1502,7 +1641,6 @@ after_initialize do
       superpromo_created_after_enabled = ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?
       superpromo_created_after_applied = (superpromo_created_after_enabled && last_digest_sent_at.present?)
 
-      # -------- HARDSALE tracking vars --------
       hardsale_has_tagged_in_top = false
       hardsale_is_skipped_hastag = false
       hardsale_is_skipped_coinflip = false
@@ -1682,7 +1820,7 @@ after_initialize do
                   eligible_superpromo_set_within_digest_list(
                     user,
                     tag_ids: superpromo_tag_ids,
-                    digest_ids: final_ids, # operate on post-promo list
+                    digest_ids: final_ids,
                     created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
                   )
 
@@ -1814,7 +1952,7 @@ after_initialize do
                   eligible_hardsale_set_within_digest_list(
                     user,
                     tag_ids: hardsale_tag_ids,
-                    digest_ids: final_ids, # operate on post-promo+superpromo list
+                    digest_ids: final_ids,
                     created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
                   )
 
@@ -2019,7 +2157,6 @@ after_initialize do
         watched_percent_enforcer_applied: watched_percent_enforcer_applied,
         watched_percent_debug: watched_percent_debug,
 
-        # -------- SUPERPROMO DEBUG --------
         superpromo_tag: superpromo_tag_for_payload,
         superpromo_tag_ids: superpromo_tag_ids,
         superpromo_injected_ids: superpromo_injected_ids,
@@ -2040,7 +2177,6 @@ after_initialize do
         superpromo_created_after_enabled: superpromo_created_after_enabled,
         superpromo_created_after_applied: superpromo_created_after_applied,
 
-        # -------- HARDSALE DEBUG --------
         hardsale_tag: hardsale_tag_for_payload,
         hardsale_tag_ids: hardsale_tag_ids,
         hardsale_injected_ids: hardsale_injected_ids,
@@ -2061,7 +2197,6 @@ after_initialize do
         hardsale_created_after_enabled: hardsale_created_after_enabled,
         hardsale_created_after_applied: hardsale_created_after_applied,
 
-        # -------- DEBUG --------
         debug_digest_build_uuid: digest_build_uuid,
         debug_for_digest_call_index: for_digest_call_index,
         debug_for_digest_since: (for_digest_since.respond_to?(:utc) ? for_digest_since.utc.iso8601 : for_digest_since),
@@ -2069,7 +2204,6 @@ after_initialize do
         debug_for_digest_callsite: for_digest_callsite,
         debug_dedupe_key: debug_dedupe_key,
 
-        # PUSH DEBUG (even if not applied, for observability)
         push_specific_enabled: push_enabled,
         push_specific_topic_id: push_tid_setting,
         push_specific_applied: false,
@@ -2179,7 +2313,6 @@ after_initialize do
       levels
     end
 
-    # Respects main setting use_watched_categories?
     def self.watched_category_ids_for_user(user)
       return [] unless ::PromoDigestSettings.use_watched_categories?
       return [] if user.nil?
@@ -2191,7 +2324,6 @@ after_initialize do
       []
     end
 
-    # Always returns watched categories (ignores use_watched_categories? switch) — used by dynamic push picker.
     def self.watched_category_ids_for_user_always(user)
       return [] if user.nil?
       levels = notification_levels(include_first_post: ::PromoDigestSettings.include_watching_first_post?)
@@ -2388,9 +2520,6 @@ after_initialize do
       [Set.new, 0, 0, [], false]
     end
 
-    # ============================================================
-    # Prefer-digest-list: eligible SUPERPROMO set inside digest list
-    # ============================================================
     def self.eligible_superpromo_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
       return [Set.new, 0, 0, [], false] if tag_ids.blank?
@@ -2434,9 +2563,6 @@ after_initialize do
       [Set.new, 0, 0, [], false]
     end
 
-    # ============================================================
-    # Prefer-digest-list: eligible HARDSALE set inside digest list
-    # ============================================================
     def self.eligible_hardsale_set_within_digest_list(user, tag_ids:, digest_ids:, created_after: nil)
       return [Set.new, 0, 0, [], false] if user.nil?
       return [Set.new, 0, 0, [], false] if tag_ids.blank?
@@ -2480,9 +2606,6 @@ after_initialize do
       [Set.new, 0, 0, [], false]
     end
 
-    # ============================================================
-    # Prefer-digest-list: swap eligible promos into target indices
-    # ============================================================
     def self.swap_eligible_promos_into_indices(ids, replace_indices, eligible_set)
       return [[], [], replace_indices] if ids.blank?
       idxs = Array(replace_indices).map(&:to_i).uniq
@@ -2531,9 +2654,6 @@ after_initialize do
       [[], [], Array(replace_indices)]
     end
 
-    # ============================================================
-    # Global picker (forum-wide)
-    # ============================================================
     def self.pick_random_promo_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_ids.blank?
@@ -2589,9 +2709,6 @@ after_initialize do
       [[], 0, 0, [], false]
     end
 
-    # ============================================================
-    # Global picker (forum-wide) SUPERPROMO
-    # ============================================================
     def self.pick_random_superpromo_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_ids.blank?
@@ -2647,9 +2764,6 @@ after_initialize do
       [[], 0, 0, [], false]
     end
 
-    # ============================================================
-    # Global picker (forum-wide) HARDSALE
-    # ============================================================
     def self.pick_random_hardsale_topic_ids(user, tag_ids:, exclude_ids:, limit:, created_after: nil)
       return [[], 0, 0, [], false] if limit.to_i <= 0
       return [[], 0, 0, [], false] if tag_ids.blank?
@@ -2801,7 +2915,6 @@ after_initialize do
       watched_percent_enforcer_applied:,
       watched_percent_debug:,
 
-      # -------- SUPERPROMO --------
       superpromo_tag:,
       superpromo_tag_ids:,
       superpromo_injected_ids:,
@@ -2822,7 +2935,6 @@ after_initialize do
       superpromo_created_after_enabled:,
       superpromo_created_after_applied:,
 
-      # -------- HARDSALE --------
       hardsale_tag:,
       hardsale_tag_ids:,
       hardsale_injected_ids:,
@@ -2850,7 +2962,6 @@ after_initialize do
       debug_for_digest_callsite:,
       debug_dedupe_key:,
 
-      # -------- PUSH --------
       push_specific_enabled:,
       push_specific_topic_id:,
       push_specific_applied:,
