@@ -3593,21 +3593,19 @@ after_initialize do
     end
 
     # Metadata only (no html_full) — we fetch the body for the single winner.
+    # Int id lists are sanitized via to_i and interpolated (mini_sql array
+    # binding support varies); everything else is a bind param.
     def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:)
       tbl = ::PromoDigestSettings.vslcampaign_table_name
-      params = { cap: scan_cap.to_i }
       where = ["COALESCE(isactive, 1) = 1", "COALESCE(html_full, '') <> ''"]
 
-      if category_ids.present?
-        where << "forcategory IN (:cats)"
-        params[:cats] = category_ids.map(&:to_i).uniq
-      end
-      if exclude_ids.present?
-        where << "id NOT IN (:excl)"
-        params[:excl] = exclude_ids.map(&:to_i).uniq
-      end
+      cats = Array(category_ids).map(&:to_i).reject(&:zero?).uniq
+      where << "forcategory IN (#{cats.join(',')})" if cats.present?
 
-      DB.query(<<~SQL, params)
+      excl = Array(exclude_ids).map(&:to_i).reject(&:zero?).uniq
+      where << "id NOT IN (#{excl.join(',')})" if excl.present?
+
+      DB.query(<<~SQL, cap: scan_cap.to_i)
         SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
                subject_titles_json, preheaders_json
         FROM #{tbl}
