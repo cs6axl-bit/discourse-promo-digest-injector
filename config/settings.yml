@@ -535,3 +535,104 @@ plugins:
     default: ""
     client: false
     type: string
+
+  # =========================
+  # VSL CAMPAIGN MODE (runs FIRST, before push + all injections)
+  # =========================
+  promo_digest_injector_vslcampaign_enabled:
+    default: false
+    client: false
+    type: bool
+
+  # "how many emails must the user have received" gate
+  promo_digest_injector_vslcampaign_min_emails_received:
+    default: 5
+    min: 0
+    max: 999999
+    client: false
+    type: integer
+
+  # If the user already got a VSL-campaign email via THIS flow within N days -> skip
+  promo_digest_injector_vslcampaign_cooldown_days:
+    default: 14
+    min: 0
+    max: 3650
+    client: false
+    type: integer
+
+  # Coinflip percent to SKIP the mode (0 = never skip, 100 = always skip)
+  promo_digest_injector_vslcampaign_skip_percent:
+    default: 50
+    min: 0
+    max: 100
+    client: false
+    type: integer
+
+  # Never send the same vsl2html_email_outputs row id to the same user within N days
+  promo_digest_injector_vslcampaign_same_campaign_cooldown_days:
+    default: 30
+    min: 0
+    max: 3650
+    client: false
+    type: integer
+
+  # Prefer a "source" (product) not mailed to this user within N days
+  promo_digest_injector_vslcampaign_source_cooldown_days:
+    default: 14
+    min: 0
+    max: 3650
+    client: false
+    type: integer
+
+  # Per-user JSON history of the last N campaigns sent this way (full details, minus html)
+  promo_digest_injector_vslcampaign_history_field:
+    default: "promo_digest_vslcampaign_last20"
+    client: false
+    type: string
+
+  promo_digest_injector_vslcampaign_history_max:
+    default: 20
+    min: 1
+    max: 200
+    client: false
+    type: integer
+
+  # What to do when the user has NO watched categories
+  promo_digest_injector_vslcampaign_no_watched_categories_behavior:
+    default: "skip"
+    type: enum
+    client: false
+    choices:
+      - "skip"
+      - "random_all"
+
+  # What to do when the user HAS watched categories but nothing viable survived the filters
+  promo_digest_injector_vslcampaign_no_viable_campaigns_behavior:
+    default: "skip"
+    type: enum
+    client: false
+    choices:
+      - "skip"
+      - "random_all"
+
+  promo_digest_injector_vslcampaign_include_watching_first_post:
+    default: true
+    client: false
+    type: bool
+
+  promo_digest_injector_vslcampaign_candidate_scan_cap:
+    default: 500
+    min: 1
+    max: 50000
+    client: false
+    type: integer
+
+  promo_digest_injector_vslcampaign_table_name:
+    default: "vsl2html_email_outputs"
+    client: false
+    type: string
+
+  promo_digest_injector_vslcampaign_campaign_key_prefix:
+    default: "vslcampaign_vsl2html"
+    client: false
+    type: string

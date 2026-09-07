@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc.
-# version: 1.7.1
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory), gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
+# version: 1.8.0
 # authors: you
 
 after_initialize do
@@ -516,6 +516,128 @@ after_initialize do
 
     def self.debug_include_opts?
       SiteSetting.promo_digest_injector_debug_include_opts == true
+    end
+
+    # ============================================================
+    # VSL CAMPAIGN MODE
+    # Runs FIRST in the digest build (before push + every injection).
+    # Picks an isactive=1 row from vsl2html_email_outputs whose
+    # forcategory the user watches, and sends it as a DigestCampaigns
+    # campaign instead of the normal digest.
+    # ============================================================
+    def self.vslcampaign_enabled?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_enabled)
+      SiteSetting.promo_digest_injector_vslcampaign_enabled == true
+    rescue
+      false
+    end
+
+    def self.vslcampaign_min_emails_received
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_min_emails_received)
+      v = SiteSetting.promo_digest_injector_vslcampaign_min_emails_received.to_i
+      v < 0 ? 0 : v
+    rescue
+      0
+    end
+
+    def self.vslcampaign_cooldown_days
+      return 14 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_cooldown_days)
+      v = SiteSetting.promo_digest_injector_vslcampaign_cooldown_days.to_i
+      v < 0 ? 0 : v
+    rescue
+      14
+    end
+
+    # Coinflip percent to SKIP the mode (0 => never skip, 100 => always skip)
+    def self.vslcampaign_skip_percent
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_skip_percent)
+      v = SiteSetting.promo_digest_injector_vslcampaign_skip_percent.to_i
+      v = 0 if v < 0
+      v = 100 if v > 100
+      v
+    rescue
+      0
+    end
+
+    def self.vslcampaign_same_campaign_cooldown_days
+      return 30 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_same_campaign_cooldown_days)
+      v = SiteSetting.promo_digest_injector_vslcampaign_same_campaign_cooldown_days.to_i
+      v < 0 ? 0 : v
+    rescue
+      30
+    end
+
+    def self.vslcampaign_source_cooldown_days
+      return 14 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_source_cooldown_days)
+      v = SiteSetting.promo_digest_injector_vslcampaign_source_cooldown_days.to_i
+      v < 0 ? 0 : v
+    rescue
+      14
+    end
+
+    def self.vslcampaign_history_field
+      return "promo_digest_vslcampaign_last20" unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_history_field)
+      SiteSetting.promo_digest_injector_vslcampaign_history_field.to_s.strip
+    rescue
+      "promo_digest_vslcampaign_last20"
+    end
+
+    def self.vslcampaign_history_max
+      return 20 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_history_max)
+      v = SiteSetting.promo_digest_injector_vslcampaign_history_max.to_i
+      v <= 0 ? 20 : v
+    rescue
+      20
+    end
+
+    # "skip" or "random_all"
+    def self.vslcampaign_no_watched_categories_behavior
+      return "skip" unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_no_watched_categories_behavior)
+      m = SiteSetting.promo_digest_injector_vslcampaign_no_watched_categories_behavior.to_s.strip.downcase
+      %w[skip random_all].include?(m) ? m : "skip"
+    rescue
+      "skip"
+    end
+
+    # "skip" or "random_all"
+    def self.vslcampaign_no_viable_campaigns_behavior
+      return "skip" unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_no_viable_campaigns_behavior)
+      m = SiteSetting.promo_digest_injector_vslcampaign_no_viable_campaigns_behavior.to_s.strip.downcase
+      %w[skip random_all].include?(m) ? m : "skip"
+    rescue
+      "skip"
+    end
+
+    def self.vslcampaign_include_watching_first_post?
+      return true unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_include_watching_first_post)
+      SiteSetting.promo_digest_injector_vslcampaign_include_watching_first_post == true
+    rescue
+      true
+    end
+
+    def self.vslcampaign_candidate_scan_cap
+      return 500 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_candidate_scan_cap)
+      v = SiteSetting.promo_digest_injector_vslcampaign_candidate_scan_cap.to_i
+      v <= 0 ? 500 : v
+    rescue
+      500
+    end
+
+    def self.vslcampaign_table_name
+      default = "vsl2html_email_outputs"
+      return default unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_table_name)
+      raw = SiteSetting.promo_digest_injector_vslcampaign_table_name.to_s.strip
+      raw.match?(/\A[a-zA-Z_][a-zA-Z0-9_]*\z/) ? raw : default
+    rescue
+      "vsl2html_email_outputs"
+    end
+
+    def self.vslcampaign_campaign_key_prefix
+      return "vslcampaign_vsl2html" unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_campaign_key_prefix)
+      raw = SiteSetting.promo_digest_injector_vslcampaign_campaign_key_prefix.to_s.strip
+      raw.blank? ? "vslcampaign_vsl2html" : raw
+    rescue
+      "vslcampaign_vsl2html"
     end
   end
 
@@ -1393,6 +1515,24 @@ after_initialize do
       end
 
       last_digest_sent_at = last_digest_sent_at_for_user(user)
+
+      # ============================================================
+      # VSL CAMPAIGN MODE — runs FIRST (before PUSH + every injection).
+      # If it queues a DigestCampaigns campaign we suppress the normal
+      # digest; the DigestCampaignPoller sends the VSL email later.
+      # ============================================================
+      if ::PromoDigestSettings.vslcampaign_enabled?
+        vslc = ::PromoDigestVslCampaign.try_run(user: user, last_digest_sent_at: last_digest_sent_at)
+        if vslc[:queued]
+          Rails.logger.info(
+            "[#{PLUGIN_NAME}] vslcampaign queued uid=#{user.id} vsl_id=#{vslc[:vsl_id]} " \
+            "source=#{vslc[:source].inspect} mode=#{vslc[:selection_mode]} " \
+            "campaign=#{vslc[:campaign_key]} queue_id=#{vslc[:queue_id]} reason=#{vslc[:reason]}"
+          )
+          Thread.current[:promo_digest_vslcampaign_result] = vslc
+          return empty_topic_relation_for_digest
+        end
+      end
 
       # ============================================================
       # PUSH OVERRIDE FLOW
@@ -3327,6 +3467,408 @@ after_initialize do
   end
 
   # ============================================================
+  # VSL CAMPAIGN MODE
+  #
+  # Runs FIRST in the digest build (before push + every injection).
+  # Flow:
+  #   1. user must have received >= vslcampaign_min_emails_received digests
+  #   2. must NOT have received a VSL-campaign email via this flow within
+  #      vslcampaign_cooldown_days
+  #   3. coinflip: vslcampaign_skip_percent chance to bail
+  #   4. look at vsl2html_email_outputs rows with isactive=1 whose
+  #      forcategory is a category the user WATCHES
+  #   5. drop rows already sent to this user within
+  #      vslcampaign_same_campaign_cooldown_days
+  #   6. prefer a "source" (product) not mailed to this user within
+  #      vslcampaign_source_cooldown_days; else fall back to any remaining row
+  #   7. build a DigestCampaigns campaign from html_full + subjects/
+  #      preheaders, enqueue the user, suppress the normal digest
+  #   8. log it (promo_digest_vslcampaign_log + per-user last-N custom field)
+  #
+  # No watched categories       -> vslcampaign_no_watched_categories_behavior
+  # Watched but nothing viable  -> vslcampaign_no_viable_campaigns_behavior
+  #   ("skip" = fall through to normal digest, "random_all" = ignore
+  #    categories, still isactive=1, still same-id cooldown)
+  # ============================================================
+  module ::PromoDigestVslCampaign
+    LOG_TABLE = "promo_digest_vslcampaign_log"
+
+    @log_table_ensured = false
+
+    def self.ensure_log_table!
+      return if @log_table_ensured
+      DB.exec(<<~SQL)
+        CREATE TABLE IF NOT EXISTS #{LOG_TABLE} (
+          id BIGSERIAL PRIMARY KEY,
+          user_id INTEGER NOT NULL,
+          vsl_id BIGINT NOT NULL,
+          source VARCHAR(500),
+          forcategory INTEGER,
+          campaign_key VARCHAR(500),
+          queue_id BIGINT,
+          selection_mode VARCHAR(40),
+          offer_url TEXT,
+          angle_name VARCHAR(255),
+          subject_lines_json TEXT,
+          preheaders_json TEXT,
+          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+      SQL
+      DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_created ON #{LOG_TABLE} (user_id, created_at)")
+      DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_vsl     ON #{LOG_TABLE} (user_id, vsl_id)")
+      DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_source  ON #{LOG_TABLE} (user_id, source)")
+      @log_table_ensured = true
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign ensure_log_table! failed: #{e.class}: #{e.message}")
+    end
+
+    def self.parse_json_string_array(raw)
+      return [] if raw.blank?
+      parsed = JSON.parse(raw.to_s)
+      return [] unless parsed.is_a?(Array)
+      parsed.map { |v| v.to_s.strip }.reject(&:blank?)
+    rescue JSON::ParserError
+      [raw.to_s.strip].reject(&:blank?)
+    end
+
+    # "how many emails the user has received" — reuses the plugin's existing
+    # digest counter (digest_sent_counter custom field), falling back to a
+    # full EmailLog digest count.
+    def self.user_email_count(user)
+      cf_key = ::PromoDigestSettings.digest_count_custom_field
+      if cf_key.present?
+        v = user.custom_fields[cf_key]
+        return v.to_i if v.present?
+      end
+      EmailLog.where(user_id: user.id, email_type: "digest").count
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign user_email_count failed: #{e.class}: #{e.message}")
+      0
+    end
+
+    def self.watched_category_ids(user)
+      levels = ::PromoDigestInjector.notification_levels(
+        include_first_post: ::PromoDigestSettings.vslcampaign_include_watching_first_post?
+      )
+      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id).map(&:to_i).uniq
+    rescue
+      []
+    end
+
+    def self.received_within_days?(user, days)
+      d = days.to_i
+      return false if d <= 0
+      ensure_log_table!
+      DB.query_single(
+        "SELECT 1 FROM #{LOG_TABLE} WHERE user_id = :uid AND created_at > :cutoff LIMIT 1",
+        uid: user.id.to_i, cutoff: (Time.now.utc - d * 86_400)
+      ).present?
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign received_within_days? failed: #{e.class}: #{e.message}")
+      false
+    end
+
+    def self.recent_campaign_ids(user, days)
+      d = days.to_i
+      return [] if d <= 0
+      ensure_log_table!
+      DB.query_single(
+        "SELECT DISTINCT vsl_id FROM #{LOG_TABLE} WHERE user_id = :uid AND created_at > :cutoff",
+        uid: user.id.to_i, cutoff: (Time.now.utc - d * 86_400)
+      ).map(&:to_i).reject(&:zero?)
+    rescue
+      []
+    end
+
+    def self.recent_sources(user, days)
+      d = days.to_i
+      return [] if d <= 0
+      ensure_log_table!
+      DB.query_single(
+        "SELECT DISTINCT source FROM #{LOG_TABLE} WHERE user_id = :uid AND source IS NOT NULL AND created_at > :cutoff",
+        uid: user.id.to_i, cutoff: (Time.now.utc - d * 86_400)
+      ).map(&:to_s).reject(&:blank?)
+    rescue
+      []
+    end
+
+    # Metadata only (no html_full) — we fetch the body for the single winner.
+    def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:)
+      tbl = ::PromoDigestSettings.vslcampaign_table_name
+      params = { cap: scan_cap.to_i }
+      where = ["COALESCE(isactive, 1) = 1", "COALESCE(html_full, '') <> ''"]
+
+      if category_ids.present?
+        where << "forcategory IN (:cats)"
+        params[:cats] = category_ids.map(&:to_i).uniq
+      end
+      if exclude_ids.present?
+        where << "id NOT IN (:excl)"
+        params[:excl] = exclude_ids.map(&:to_i).uniq
+      end
+
+      DB.query(<<~SQL, params)
+        SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
+               subject_titles_json, preheaders_json
+        FROM #{tbl}
+        WHERE #{where.join(" AND ")}
+        ORDER BY random()
+        LIMIT :cap
+      SQL
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign fetch_candidate_meta failed: #{e.class}: #{e.message}")
+      []
+    end
+
+    def self.fetch_html_full(id)
+      tbl = ::PromoDigestSettings.vslcampaign_table_name
+      row = DB.query("SELECT html_full FROM #{tbl} WHERE id = :id LIMIT 1", id: id.to_i).first
+      row&.html_full.to_s
+    rescue
+      ""
+    end
+
+    # Prefer a product/source not mailed recently; else any remaining row
+    # (same-id cooldown was already applied when the pool was built).
+    def self.choose_candidate(candidates, recent_source_set)
+      return nil if candidates.blank?
+      fresh = candidates.reject { |c| c.source.present? && recent_source_set.include?(c.source.to_s) }
+      (fresh.presence || candidates).sample
+    end
+
+    def self.ensure_campaign!(vsl_id:, html_full:, subjects:, preheaders:)
+      key  = "#{::PromoDigestSettings.vslcampaign_campaign_key_prefix}_#{vsl_id.to_i}"
+      subs = Array(subjects).map { |s| s.to_s.strip }
+      pre  = Array(preheaders).map { |s| s.to_s.strip }
+
+      attrs = {
+        selection_sql:     "SELECT NULL::integer AS user_id WHERE 1=0",
+        enabled:           true,
+        topic_sets:        [],
+        custom_html_body:  html_full.to_s,
+        preheader_line_1:  pre[0].to_s,
+        preheader_line_2:  pre[1].to_s,
+        subject_line_1:    subs[0].to_s,
+        subject_line_2:    subs[1].to_s,
+        subject_line_3:    subs[2].to_s,
+        send_at:           nil,
+        last_error:        nil,
+        last_populated_at: Time.zone.now
+      }
+
+      campaign = ::DigestCampaigns::Campaign.find_or_initialize_by(campaign_key: key)
+      campaign.assign_attributes(attrs)
+      campaign.save!
+      [campaign, key]
+    end
+
+    def self.enqueue_user!(user_id:, campaign_key:)
+      uid = user_id.to_i
+      key = campaign_key.to_s.strip
+
+      existing = DB.query(<<~SQL, campaign_key: key, user_id: uid).first
+        SELECT id, status
+        FROM #{::DigestCampaigns::QUEUE_TABLE}
+        WHERE campaign_key = :campaign_key AND user_id = :user_id
+        LIMIT 1
+      SQL
+      return { ok: true, queue_id: existing.id.to_i, status: existing.status.to_s, action: "existing" } if existing.present?
+
+      row = DB.query(<<~SQL, campaign_key: key, user_id: uid).first
+        INSERT INTO #{::DigestCampaigns::QUEUE_TABLE}
+          (campaign_key, user_id, chosen_topic_ids, not_before, status, attempts, created_at, updated_at)
+        VALUES
+          (:campaign_key, :user_id, '{}'::int[], NULL, 'queued', 0, NOW(), NOW())
+        RETURNING id, status
+      SQL
+      return { ok: false, reason: "insert_failed" } if row.nil?
+
+      { ok: true, queue_id: row.id.to_i, status: row.status.to_s, action: "inserted" }
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign enqueue_user! failed: #{e.class}: #{e.message}")
+      { ok: false, reason: "#{e.class}: #{e.message}" }
+    end
+
+    def self.record_send!(user:, cand:, campaign_key:, queue_id:, selection_mode:, subjects:, preheaders:)
+      ensure_log_table!
+
+      log_params = {
+        uid: user.id.to_i,
+        vsl_id: cand.id.to_i,
+        source: cand.source.to_s.presence,
+        cat: cand.forcategory.to_i,
+        key: campaign_key.to_s,
+        qid: queue_id.to_i,
+        mode: selection_mode.to_s,
+        offer: cand.offer_url.to_s.presence,
+        angle: cand.angle_name.to_s.presence,
+        subs: subjects.to_json,
+        pre: preheaders.to_json
+      }
+
+      DB.exec(<<~SQL, log_params)
+        INSERT INTO #{LOG_TABLE}
+          (user_id, vsl_id, source, forcategory, campaign_key, queue_id, selection_mode,
+           offer_url, angle_name, subject_lines_json, preheaders_json, created_at)
+        VALUES
+          (:uid, :vsl_id, :source, :cat, :key, :qid, :mode, :offer, :angle, :subs, :pre, NOW())
+      SQL
+
+      persist_history!(user, {
+        "ts"               => Time.now.utc.iso8601,
+        "vsl_id"           => cand.id.to_i,
+        "source"           => cand.source.to_s,
+        "forcategory"      => cand.forcategory.to_i,
+        "offer_url"        => cand.offer_url.to_s,
+        "angle_name"       => cand.angle_name.to_s,
+        "angle_short_name" => cand.angle_short_name.to_s,
+        "subject_lines"    => Array(subjects),
+        "preheaders"       => Array(preheaders),
+        "campaign_key"     => campaign_key.to_s,
+        "queue_id"         => queue_id.to_i,
+        "selection_mode"   => selection_mode.to_s
+      })
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign record_send! failed: #{e.class}: #{e.message}")
+    end
+
+    # Per-user JSON array in custom_fields — newest first, capped at history_max.
+    def self.persist_history!(user, entry)
+      field = ::PromoDigestSettings.vslcampaign_history_field
+      return if field.blank?
+      max_n = ::PromoDigestSettings.vslcampaign_history_max
+
+      User.transaction do
+        u = User.lock.find(user.id)
+        prev =
+          begin
+            JSON.parse(u.custom_fields[field].to_s)
+          rescue
+            []
+          end
+        prev = Array(prev).select { |x| x.is_a?(Hash) }
+        u.custom_fields[field] = ([entry] + prev).first(max_n).to_json
+        u.save_custom_fields(true)
+      end
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign persist_history! failed: #{e.class}: #{e.message}")
+    end
+
+    # Returns { queued: true, ... } when a campaign was queued (suppress digest),
+    # or { queued: false, reason: "..." } to fall through to the normal flow.
+    def self.try_run(user:, last_digest_sent_at: nil)
+      out = { queued: false, reason: nil }
+      return out.merge(reason: "disabled")     unless ::PromoDigestSettings.vslcampaign_enabled?
+      return out.merge(reason: "user_missing") if user.nil?
+      unless defined?(::DigestCampaigns::Campaign) && defined?(::DigestCampaigns::QUEUE_TABLE)
+        return out.merge(reason: "digest_campaigns_plugin_missing")
+      end
+
+      # ---- Gate 1: minimum emails received -----------------------------
+      min_emails  = ::PromoDigestSettings.vslcampaign_min_emails_received
+      email_count = user_email_count(user)
+      if min_emails > 0 && email_count < min_emails
+        return out.merge(reason: "min_emails_not_met", email_count: email_count, required: min_emails)
+      end
+
+      # ---- Gate 2: cooldown for THIS flow -----------------------------
+      cooldown_days = ::PromoDigestSettings.vslcampaign_cooldown_days
+      if cooldown_days > 0 && received_within_days?(user, cooldown_days)
+        return out.merge(reason: "flow_cooldown", cooldown_days: cooldown_days)
+      end
+
+      # ---- Gate 3: coinflip percent to skip --------------------------
+      skip_pct = ::PromoDigestSettings.vslcampaign_skip_percent
+      if skip_pct > 0 && rand(100) < skip_pct
+        return out.merge(reason: "coinflip_skip", skip_percent: skip_pct)
+      end
+
+      same_id_days = ::PromoDigestSettings.vslcampaign_same_campaign_cooldown_days
+      source_days  = ::PromoDigestSettings.vslcampaign_source_cooldown_days
+      scan_cap     = ::PromoDigestSettings.vslcampaign_candidate_scan_cap
+
+      exclude_ids = recent_campaign_ids(user, same_id_days)
+      recent_srcs = recent_sources(user, source_days).to_set
+
+      watched        = watched_category_ids(user)
+      selection_mode = nil
+      candidates     = []
+
+      if watched.present?
+        selection_mode = "watched"
+        candidates = fetch_candidate_meta(category_ids: watched, exclude_ids: exclude_ids, scan_cap: scan_cap)
+
+        if candidates.blank?
+          case ::PromoDigestSettings.vslcampaign_no_viable_campaigns_behavior
+          when "random_all"
+            selection_mode = "random_all_no_viable"
+            candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap)
+          else
+            return out.merge(reason: "no_viable_campaigns_watched")
+          end
+        end
+      else
+        case ::PromoDigestSettings.vslcampaign_no_watched_categories_behavior
+        when "random_all"
+          selection_mode = "random_all_no_watched"
+          candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap)
+        else
+          return out.merge(reason: "no_watched_categories")
+        end
+      end
+
+      return out.merge(reason: "no_candidates", selection_mode: selection_mode) if candidates.blank?
+
+      cand = choose_candidate(candidates, recent_srcs)
+      return out.merge(reason: "no_candidate_chosen", selection_mode: selection_mode) if cand.nil?
+
+      subjects   = parse_json_string_array(cand.subject_titles_json)
+      preheaders = parse_json_string_array(cand.preheaders_json)
+
+      html_full = fetch_html_full(cand.id)
+      return out.merge(reason: "chosen_candidate_no_html", vsl_id: cand.id.to_i) if html_full.strip.blank?
+
+      campaign, campaign_key = ensure_campaign!(
+        vsl_id: cand.id, html_full: html_full, subjects: subjects, preheaders: preheaders
+      )
+
+      enq = enqueue_user!(user_id: user.id, campaign_key: campaign_key)
+      return out.merge(reason: (enq[:reason] || "enqueue_failed"), campaign_key: campaign_key) unless enq[:ok]
+
+      if enq[:action] == "existing"
+        # Already queued from an earlier build — suppress digest, don't double-log.
+        return out.merge(
+          queued: true, vsl_id: cand.id.to_i, source: cand.source.to_s,
+          campaign_key: campaign_key, queue_id: enq[:queue_id],
+          selection_mode: selection_mode, reason: "already_queued"
+        )
+      end
+
+      record_send!(
+        user: user, cand: cand, campaign_key: campaign_key, queue_id: enq[:queue_id],
+        selection_mode: selection_mode, subjects: subjects, preheaders: preheaders
+      )
+
+      out.merge(
+        queued:          true,
+        vsl_id:          cand.id.to_i,
+        source:          cand.source.to_s,
+        forcategory:     cand.forcategory.to_i,
+        campaign_id:     campaign&.id,
+        campaign_key:    campaign_key,
+        queue_id:        enq[:queue_id],
+        selection_mode:  selection_mode,
+        email_count:     email_count,
+        candidate_count: candidates.length,
+        reason:          "queued"
+      )
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign try_run failed uid=#{user&.id}: #{e.class}: #{e.message}")
+      { queued: false, reason: "error", error: "#{e.class}: #{e.message}" }
+    end
+  end
+
+  # ============================================================
   # Wrapper: sets build UUID + resets call counter per digest build
   # ============================================================
   module ::PromoDigestDigestWrapper
@@ -3339,11 +3881,13 @@ after_initialize do
       Thread.current[:promo_digest_opts_sanitized] = nil
       Thread.current[:promo_digest_callsite] = nil
       Thread.current[:promo_digest_replaced_by_hardsale_campaign] = nil
+      Thread.current[:promo_digest_vslcampaign_result] = nil
 
       super
     ensure
       Thread.current[:promo_digest_in_digest] = false
       Thread.current[:promo_digest_replaced_by_hardsale_campaign] = nil
+      Thread.current[:promo_digest_vslcampaign_result] = nil
     end
   end
   ::UserNotifications.prepend ::PromoDigestDigestWrapper
