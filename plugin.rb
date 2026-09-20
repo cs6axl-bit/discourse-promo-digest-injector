@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory), gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.8.0
+# version: 1.9.0
 # authors: you
 
 after_initialize do
@@ -1523,6 +1523,9 @@ after_initialize do
       # ============================================================
       if ::PromoDigestSettings.vslcampaign_enabled?
         vslc = ::PromoDigestVslCampaign.try_run(user: user, last_digest_sent_at: last_digest_sent_at)
+        # Report the outcome back to discourse-digest-campaigns (it owns this hash for the send).
+        ov = Thread.current[:digest_campaign_vsl_override]
+        ov[:result] = vslc if ov.is_a?(Hash)
         if vslc[:queued]
           Rails.logger.info(
             "[#{PLUGIN_NAME}] vslcampaign queued uid=#{user.id} vsl_id=#{vslc[:vsl_id]} " \
@@ -3595,9 +3598,18 @@ after_initialize do
     # Metadata only (no html_full) — we fetch the body for the single winner.
     # Int id lists are sanitized via to_i and interpolated (mini_sql array
     # binding support varies); everything else is a bind param.
-    def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:)
+    def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:, allowed_sources: [])
       tbl = ::PromoDigestSettings.vslcampaign_table_name
       where = ["COALESCE(isactive, 1) = 1", "COALESCE(html_full, '') <> ''"]
+      params = { cap: scan_cap.to_i }
+
+      # Optional per-send restriction (digest-campaigns override): only these `source` values
+      # (case-insensitive, exact match) may be selected.
+      srcs = Array(allowed_sources).map { |x| x.to_s.strip.downcase }.reject(&:empty?).uniq
+      if srcs.present?
+        names = srcs.each_with_index.map { |v, i| params[:"src#{i}"] = v; ":src#{i}" }
+        where << "LOWER(source) IN (#{names.join(',')})"
+      end
 
       cats = Array(category_ids).map(&:to_i).reject(&:zero?).uniq
       where << "forcategory IN (#{cats.join(',')})" if cats.present?
@@ -3605,7 +3617,7 @@ after_initialize do
       excl = Array(exclude_ids).map(&:to_i).reject(&:zero?).uniq
       where << "id NOT IN (#{excl.join(',')})" if excl.present?
 
-      DB.query(<<~SQL, cap: scan_cap.to_i)
+      DB.query(<<~SQL, params)
         SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
                subject_titles_json, preheaders_json
         FROM #{tbl}
@@ -3762,21 +3774,30 @@ after_initialize do
         return out.merge(reason: "digest_campaigns_plugin_missing")
       end
 
+      # Per-send override set by discourse-digest-campaigns ("regular digest" campaigns):
+      #   :direct            -> skip Gate 2 (flow cooldown)
+      #   :ignore_min_emails -> skip Gate 1 (min emails received)
+      #   :skip_coinflip     -> skip Gate 3 (skip-percent coinflip)
+      #   :allowed_sources   -> only pick campaigns whose `source` is in this list
+      ov = Thread.current[:digest_campaign_vsl_override]
+      ov = {} unless ov.is_a?(Hash)
+      allowed_sources = Array(ov[:allowed_sources])
+
       # ---- Gate 1: minimum emails received -----------------------------
-      min_emails  = ::PromoDigestSettings.vslcampaign_min_emails_received
+      min_emails  = ov[:ignore_min_emails] == true ? 0 : ::PromoDigestSettings.vslcampaign_min_emails_received
       email_count = user_email_count(user)
       if min_emails > 0 && email_count < min_emails
         return out.merge(reason: "min_emails_not_met", email_count: email_count, required: min_emails)
       end
 
       # ---- Gate 2: cooldown for THIS flow -----------------------------
-      cooldown_days = ::PromoDigestSettings.vslcampaign_cooldown_days
+      cooldown_days = ov[:direct] == true ? 0 : ::PromoDigestSettings.vslcampaign_cooldown_days
       if cooldown_days > 0 && received_within_days?(user, cooldown_days)
         return out.merge(reason: "flow_cooldown", cooldown_days: cooldown_days)
       end
 
       # ---- Gate 3: coinflip percent to skip --------------------------
-      skip_pct = ::PromoDigestSettings.vslcampaign_skip_percent
+      skip_pct = ov[:skip_coinflip] == true ? 0 : ::PromoDigestSettings.vslcampaign_skip_percent
       if skip_pct > 0 && rand(100) < skip_pct
         return out.merge(reason: "coinflip_skip", skip_percent: skip_pct)
       end
@@ -3794,13 +3815,13 @@ after_initialize do
 
       if watched.present?
         selection_mode = "watched"
-        candidates = fetch_candidate_meta(category_ids: watched, exclude_ids: exclude_ids, scan_cap: scan_cap)
+        candidates = fetch_candidate_meta(category_ids: watched, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
 
         if candidates.blank?
           case ::PromoDigestSettings.vslcampaign_no_viable_campaigns_behavior
           when "random_all"
             selection_mode = "random_all_no_viable"
-            candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap)
+            candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
           else
             return out.merge(reason: "no_viable_campaigns_watched")
           end
@@ -3809,7 +3830,7 @@ after_initialize do
         case ::PromoDigestSettings.vslcampaign_no_watched_categories_behavior
         when "random_all"
           selection_mode = "random_all_no_watched"
-          candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap)
+          candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
         else
           return out.merge(reason: "no_watched_categories")
         end
