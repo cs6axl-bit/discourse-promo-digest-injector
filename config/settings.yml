@@ -636,3 +636,11 @@ plugins:
     default: "vslcampaign_vsl2html"
     client: false
     type: string
+
+  # user_custom_fields name holding the user's gender. A VSL campaign whose for_gender
+  # is set is also eligible for users whose gender matches (case-insensitive), even if
+  # they don't watch its forcategory. Empty for_gender = no gender route (category only).
+  promo_digest_injector_vslcampaign_gender_field:
+    default: "user_field_1"
+    client: false
+    type: string

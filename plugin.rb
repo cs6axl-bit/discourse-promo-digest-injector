@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
-# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory), gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.9.0
+# about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
+# version: 1.10.0
 # authors: you
 
 after_initialize do
@@ -638,6 +638,13 @@ after_initialize do
       raw.blank? ? "vslcampaign_vsl2html" : raw
     rescue
       "vslcampaign_vsl2html"
+    end
+
+    def self.vslcampaign_gender_field
+      return "user_field_1" unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_gender_field)
+      SiteSetting.promo_digest_injector_vslcampaign_gender_field.to_s.strip
+    rescue
+      "user_field_1"
     end
   end
 
@@ -3479,7 +3486,9 @@ after_initialize do
   #      vslcampaign_cooldown_days
   #   3. coinflip: vslcampaign_skip_percent chance to bail
   #   4. look at vsl2html_email_outputs rows with isactive=1 whose
-  #      forcategory is a category the user WATCHES
+  #      forcategory is a category the user WATCHES, OR whose for_gender is
+  #      set and equals the user's gender (vslcampaign_gender_field,
+  #      case-insensitive). Empty for_gender = category match only.
   #   5. drop rows already sent to this user within
   #      vslcampaign_same_campaign_cooldown_days
   #   6. prefer a "source" (product) not mailed to this user within
@@ -3488,10 +3497,12 @@ after_initialize do
   #      preheaders, enqueue the user, suppress the normal digest
   #   8. log it (promo_digest_vslcampaign_log + per-user last-N custom field)
   #
-  # No watched categories       -> vslcampaign_no_watched_categories_behavior
+  # No watched categories and no gender-matched campaign
+  #                             -> vslcampaign_no_watched_categories_behavior
   # Watched but nothing viable  -> vslcampaign_no_viable_campaigns_behavior
   #   ("skip" = fall through to normal digest, "random_all" = ignore
-  #    categories, still isactive=1, still same-id cooldown)
+  #    categories, still isactive=1, still same-id cooldown, and skip
+  #    campaigns whose for_gender is set to a different gender)
   # ============================================================
   module ::PromoDigestVslCampaign
     LOG_TABLE = "promo_digest_vslcampaign_log"
@@ -3558,6 +3569,52 @@ after_initialize do
       []
     end
 
+    # User's gender from user_custom_fields (vslcampaign_gender_field), lowercased; "" if unset.
+    def self.user_gender(user)
+      field = ::PromoDigestSettings.vslcampaign_gender_field
+      return "" if field.blank?
+      UserCustomField.where(user_id: user.id, name: field).pluck(:value).first.to_s.strip.downcase
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign user_gender failed: #{e.class}: #{e.message}")
+      ""
+    end
+
+    FOR_GENDER_CHECK_TTL = 600
+
+    # Whether the campaign table has a for_gender column. Tries to add it once per process
+    # when missing; re-checks every FOR_GENDER_CHECK_TTL seconds so a column added by hand
+    # is picked up without a restart.
+    def self.for_gender_column?
+      now = Time.now.to_i
+      return @for_gender_col if !@for_gender_col.nil? && now - @for_gender_checked_at.to_i < FOR_GENDER_CHECK_TTL
+
+      tbl = ::PromoDigestSettings.vslcampaign_table_name
+      exists = lambda do
+        DB.query_single(<<~SQL, t: tbl).present?
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = :t AND column_name = 'for_gender'
+          LIMIT 1
+        SQL
+      end
+
+      found = exists.call
+      if !found && !@for_gender_add_tried
+        @for_gender_add_tried = true
+        begin
+          DB.exec("ALTER TABLE #{tbl} ADD COLUMN IF NOT EXISTS for_gender VARCHAR(100)")
+          found = exists.call
+        rescue => e
+          Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign could not add #{tbl}.for_gender: #{e.class}: #{e.message}")
+        end
+      end
+
+      @for_gender_checked_at = now
+      @for_gender_col = found
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign for_gender_column? failed: #{e.class}: #{e.message}")
+      false
+    end
+
     def self.received_within_days?(user, days)
       d = days.to_i
       return false if d <= 0
@@ -3598,8 +3655,15 @@ after_initialize do
     # Metadata only (no html_full) — we fetch the body for the single winner.
     # Int id lists are sanitized via to_i and interpolated (mini_sql array
     # binding support varies); everything else is a bind param.
-    def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:, allowed_sources: [])
+    #
+    # category_ids / gender: a row matches if its forcategory is in category_ids OR its
+    # for_gender is set and equals `gender`. Both blank = no targeting filter (random_all).
+    #
+    # gender_gate (random_all fallbacks): when non-nil, drop rows whose for_gender is set
+    # and differs from it ("" = user has no gender -> only rows with empty for_gender).
+    def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:, allowed_sources: [], gender: nil, gender_gate: nil)
       tbl = ::PromoDigestSettings.vslcampaign_table_name
+      has_gender_col = for_gender_column?
       where = ["COALESCE(isactive, 1) = 1", "COALESCE(html_full, '') <> ''"]
       params = { cap: scan_cap.to_i }
 
@@ -3611,15 +3675,28 @@ after_initialize do
         where << "LOWER(source) IN (#{names.join(',')})"
       end
 
+      match = []
       cats = Array(category_ids).map(&:to_i).reject(&:zero?).uniq
-      where << "forcategory IN (#{cats.join(',')})" if cats.present?
+      match << "forcategory IN (#{cats.join(',')})" if cats.present?
+
+      g = gender.to_s.strip.downcase
+      if g.present? && has_gender_col
+        params[:gender] = g
+        match << "(COALESCE(TRIM(for_gender), '') <> '' AND LOWER(TRIM(for_gender)) = :gender)"
+      end
+      where << "(#{match.join(' OR ')})" if match.present?
+
+      if !gender_gate.nil? && has_gender_col
+        params[:gate_gender] = gender_gate.to_s.strip.downcase
+        where << "(COALESCE(TRIM(for_gender), '') = '' OR LOWER(TRIM(for_gender)) = :gate_gender)"
+      end
 
       excl = Array(exclude_ids).map(&:to_i).reject(&:zero?).uniq
       where << "id NOT IN (#{excl.join(',')})" if excl.present?
 
       DB.query(<<~SQL, params)
         SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
-               subject_titles_json, preheaders_json
+               subject_titles_json, preheaders_json#{has_gender_col ? ', for_gender' : ''}
         FROM #{tbl}
         WHERE #{where.join(" AND ")}
         ORDER BY random()
@@ -3810,27 +3887,51 @@ after_initialize do
       recent_srcs = recent_sources(user, source_days).to_set
 
       watched        = watched_category_ids(user)
+      # Only campaigns with for_gender set can match on gender (empty = category only).
+      gender         = for_gender_column? ? user_gender(user) : ""
       selection_mode = nil
       candidates     = []
 
-      if watched.present?
+      # random_all fallbacks ignore categories but still skip campaigns aimed at another gender.
+      fetch_all = lambda do
+        fetch_candidate_meta(
+          category_ids: nil, gender_gate: gender, exclude_ids: exclude_ids,
+          scan_cap: scan_cap, allowed_sources: allowed_sources
+        )
+      end
+
+      if watched.present? || gender.present?
         selection_mode = "watched"
-        candidates = fetch_candidate_meta(category_ids: watched, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
+        candidates = fetch_candidate_meta(
+          category_ids: watched, gender: gender, exclude_ids: exclude_ids,
+          scan_cap: scan_cap, allowed_sources: allowed_sources
+        )
 
         if candidates.blank?
-          case ::PromoDigestSettings.vslcampaign_no_viable_campaigns_behavior
-          when "random_all"
-            selection_mode = "random_all_no_viable"
-            candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
+          if watched.present?
+            case ::PromoDigestSettings.vslcampaign_no_viable_campaigns_behavior
+            when "random_all"
+              selection_mode = "random_all_no_viable"
+              candidates = fetch_all.call
+            else
+              return out.merge(reason: "no_viable_campaigns_watched", gender: gender.presence)
+            end
           else
-            return out.merge(reason: "no_viable_campaigns_watched")
+            # No watched categories and no gender-matched campaign: same as before gender existed.
+            case ::PromoDigestSettings.vslcampaign_no_watched_categories_behavior
+            when "random_all"
+              selection_mode = "random_all_no_watched"
+              candidates = fetch_all.call
+            else
+              return out.merge(reason: "no_watched_categories", gender: gender.presence)
+            end
           end
         end
       else
         case ::PromoDigestSettings.vslcampaign_no_watched_categories_behavior
         when "random_all"
           selection_mode = "random_all_no_watched"
-          candidates = fetch_candidate_meta(category_ids: nil, exclude_ids: exclude_ids, scan_cap: scan_cap, allowed_sources: allowed_sources)
+          candidates = fetch_all.call
         else
           return out.merge(reason: "no_watched_categories")
         end
@@ -3840,6 +3941,11 @@ after_initialize do
 
       cand = choose_candidate(candidates, recent_srcs)
       return out.merge(reason: "no_candidate_chosen", selection_mode: selection_mode) if cand.nil?
+
+      # Record which rule matched: category watch wins; otherwise it came in via for_gender.
+      if selection_mode == "watched" && !watched.include?(cand.forcategory.to_i)
+        selection_mode = "gender"
+      end
 
       subjects   = parse_json_string_array(cand.subject_titles_json)
       preheaders = parse_json_string_array(cand.preheaders_json)
@@ -3877,6 +3983,7 @@ after_initialize do
         campaign_key:    campaign_key,
         queue_id:        enq[:queue_id],
         selection_mode:  selection_mode,
+        gender:          gender.presence,
         email_count:     email_count,
         candidate_count: candidates.length,
         reason:          "queued"
