@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.10.0
+# version: 1.10.1
 # authors: you
 
 after_initialize do
@@ -3749,6 +3749,13 @@ after_initialize do
       [campaign, key]
     end
 
+    # Statuses that mean the row is still on its way out; anything else is finished.
+    PENDING_QUEUE_STATUSES = %w[queued processing].freeze
+
+    # The queue is unique on (campaign_key, user_id) and finished rows are never deleted,
+    # so re-picking a vsl_id after its cooldown hits the old row:
+    #   pending row  -> "existing" (same send, e.g. digest rebuilt before the poller ran)
+    #   finished row -> reset it to queued -> "requeued" (a new send; caller logs it)
     def self.enqueue_user!(user_id:, campaign_key:)
       uid = user_id.to_i
       key = campaign_key.to_s.strip
@@ -3759,7 +3766,31 @@ after_initialize do
         WHERE campaign_key = :campaign_key AND user_id = :user_id
         LIMIT 1
       SQL
-      return { ok: true, queue_id: existing.id.to_i, status: existing.status.to_s, action: "existing" } if existing.present?
+
+      if existing.present?
+        if PENDING_QUEUE_STATUSES.include?(existing.status.to_s)
+          return { ok: true, queue_id: existing.id.to_i, status: existing.status.to_s, action: "existing" }
+        end
+
+        # Conditional on status so a concurrent requeue of the same row can't double-count.
+        row = DB.query(<<~SQL, id: existing.id.to_i).first
+          UPDATE #{::DigestCampaigns::QUEUE_TABLE}
+          SET status = 'queued',
+              chosen_topic_ids = '{}'::int[],
+              not_before = NULL,
+              locked_at = NULL,
+              attempts = 0,
+              last_error = NULL,
+              sent_at = NULL,
+              updated_at = NOW()
+          WHERE id = :id AND status NOT IN (#{PENDING_QUEUE_STATUSES.map { |s| "'#{s}'" }.join(',')})
+          RETURNING id, status
+        SQL
+        return { ok: true, queue_id: row.id.to_i, status: row.status.to_s, action: "requeued" } if row.present?
+
+        # Lost the race: another build already requeued it, so this send is pending.
+        return { ok: true, queue_id: existing.id.to_i, status: "queued", action: "existing" }
+      end
 
       row = DB.query(<<~SQL, campaign_key: key, user_id: uid).first
         INSERT INTO #{::DigestCampaigns::QUEUE_TABLE}
@@ -3961,7 +3992,8 @@ after_initialize do
       return out.merge(reason: (enq[:reason] || "enqueue_failed"), campaign_key: campaign_key) unless enq[:ok]
 
       if enq[:action] == "existing"
-        # Already queued from an earlier build — suppress digest, don't double-log.
+        # Still pending from an earlier build — suppress digest, don't double-log.
+        # ("requeued" = a finished row reset for a new send; it falls through and is logged.)
         return out.merge(
           queued: true, vsl_id: cand.id.to_i, source: cand.source.to_s,
           campaign_key: campaign_key, queue_id: enq[:queue_id],
