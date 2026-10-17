@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.10.1
+# version: 1.12.0
 # authors: you
 
 after_initialize do
@@ -394,6 +394,38 @@ after_initialize do
       v <= 0 ? 500 : v
     end
 
+    def self.max_topic_age_enabled?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_max_topic_age_enabled)
+      SiteSetting.promo_digest_injector_max_topic_age_enabled == true
+    rescue
+      false
+    end
+
+    def self.max_topic_age_days
+      return 30 unless SiteSetting.respond_to?(:promo_digest_injector_max_topic_age_days)
+      v = SiteSetting.promo_digest_injector_max_topic_age_days.to_i
+      v <= 0 ? 30 : v
+    rescue
+      30
+    end
+
+    # When the user has no previous digest, "created after last digest" filters use
+    # "created within the last X days" instead. 0 => no filter for first-time users.
+    def self.created_after_fallback_days
+      return 30 unless SiteSetting.respond_to?(:promo_digest_injector_created_after_fallback_days)
+      v = SiteSetting.promo_digest_injector_created_after_fallback_days.to_i
+      v < 0 ? 0 : v
+    rescue
+      30
+    end
+
+    def self.watched_enforce_require_created_after_last_digest?
+      return true unless SiteSetting.respond_to?(:promo_digest_injector_watched_enforce_require_created_after_last_digest)
+      SiteSetting.promo_digest_injector_watched_enforce_require_created_after_last_digest == true
+    rescue
+      true
+    end
+
     # -------- SUPERPROMO --------
     def self.superpromo_enabled?
       SiteSetting.promo_digest_injector_superpromo_enabled == true
@@ -730,6 +762,38 @@ after_initialize do
       nil
     end
 
+    # ----------------------------
+    # Cutoff for every "created after last digest" filter:
+    # last digest sent time, or (no previous digest) now - fallback days.
+    # nil => no filter.
+    # ----------------------------
+    def self.created_after_cutoff_for_user(user)
+      ts = last_digest_sent_at_for_user(user)
+      return ts if ts.present?
+
+      days = ::PromoDigestSettings.created_after_fallback_days
+      days > 0 ? (Time.now.utc - days * 86_400) : nil
+    end
+
+    # ----------------------------
+    # Max topic age: every digest topic must be created after this. nil => off.
+    # ----------------------------
+    def self.max_topic_age_cutoff
+      return nil unless ::PromoDigestSettings.max_topic_age_enabled?
+      Time.now.utc - ::PromoDigestSettings.max_topic_age_days * 86_400
+    end
+
+    # The stricter (later) of two optional cutoffs.
+    def self.later_cutoff(a, b)
+      [a, b].compact.max
+    end
+
+    def self.drop_topics_older_than(ids, cutoff)
+      return ids if cutoff.nil? || ids.blank?
+      keep = Topic.where(id: ids).where("topics.created_at > ?", cutoff).pluck(:id).map(&:to_i).to_set
+      ids.select { |tid| keep.include?(tid.to_i) }
+    end
+
     # ============================================================
     # SUPERPUSH CONTEXT (NEW)
     # Determines if superpush restriction is active for this user,
@@ -1048,6 +1112,11 @@ after_initialize do
       total = ids.length
       target_count = ((total * pct) / 100.0).ceil
 
+      created_after = later_cutoff(
+        (::PromoDigestSettings.watched_enforce_require_created_after_last_digest? ? last_digest_sent_at : nil),
+        max_topic_age_cutoff
+      )
+
       current_watched_count =
         ids.count do |tid|
           cid = tid_to_cid[tid.to_i]
@@ -1064,7 +1133,9 @@ after_initialize do
         replaced_positions: [],
         replaced_out_ids: [],
         replaced_in_ids: [],
-        replaced_source: [] # "lookahead" or "forum"
+        replaced_source: [], # "lookahead" or "forum"
+        created_after_required: ::PromoDigestSettings.watched_enforce_require_created_after_last_digest?,
+        created_after_ts: (created_after.present? ? created_after.utc.iso8601 : nil)
       }
 
       return [ids, false, debug, watched_ids] if current_watched_count >= target_count
@@ -1095,13 +1166,15 @@ after_initialize do
         extra_ids = extra_ids - new_ids
 
         if extra_ids.present?
-          extra_visible =
+          extra_scope =
             Topic
               .visible
               .secured(guardian)
               .where(id: extra_ids, category_id: watched_ids)
-              .pluck(:id)
-              .map(&:to_i)
+
+          extra_scope = extra_scope.where("topics.created_at > ?", created_after) if created_after.present?
+
+          extra_visible = extra_scope.pluck(:id).map(&:to_i)
 
           if extra_visible.present?
             extra_visible_sorted =
@@ -1132,7 +1205,7 @@ after_initialize do
         end
       end
 
-      # Step 2: forum-wide watched categories, created_after_last_digest if known
+      # Step 2: forum-wide watched categories (created_after_last_digest if required + known)
       if need > 0 && replace_positions.present?
         scan_cap = ::PromoDigestSettings.watched_enforce_forum_scan_cap
 
@@ -1143,7 +1216,7 @@ after_initialize do
             .where(category_id: watched_ids)
             .where.not(id: new_ids)
 
-        scope = scope.where("topics.created_at > ?", last_digest_sent_at) if last_digest_sent_at.present?
+        scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
 
         forum_candidates =
           scope
@@ -1239,7 +1312,7 @@ after_initialize do
       watched_ids = sp_ctx[:used_category_ids]
 
       created_after_required = ::PromoDigestSettings.push_specific_dynamic_require_created_after_last_digest?
-      created_after = (created_after_required ? last_digest_sent_at : nil)
+      created_after = later_cutoff((created_after_required ? last_digest_sent_at : nil), max_topic_age_cutoff)
 
       exclude_recent = ::PromoDigestSettings.push_specific_exclude_recent_pushed?
       exclude_days = ::PromoDigestSettings.push_specific_exclude_recent_pushed_days
@@ -1500,6 +1573,11 @@ after_initialize do
 
       limit = extract_limit(opts)
 
+      # MAX TOPIC AGE: restrict core's digest list itself, so the list (and every
+      # lookahead built from it) only holds recent topics; pickers get age_cutoff too.
+      age_cutoff = max_topic_age_cutoff
+      original_relation = original_relation.where("topics.created_at > ?", age_cutoff) if age_cutoff
+
       # ---------- DEBUG CONTEXT ----------
       digest_build_uuid = Thread.current[:promo_digest_build_uuid]
       for_digest_call_index = Thread.current[:promo_digest_for_digest_call_index]
@@ -1522,6 +1600,7 @@ after_initialize do
       end
 
       last_digest_sent_at = last_digest_sent_at_for_user(user)
+      created_after_cutoff = created_after_cutoff_for_user(user)
 
       # ============================================================
       # VSL CAMPAIGN MODE — runs FIRST (before PUSH + every injection).
@@ -1605,14 +1684,9 @@ after_initialize do
                   sp_active = sp_ctx[:active]
                   sp_watched_ids = sp_ctx[:used_category_ids]
 
-                  row =
-                    Topic
-                      .visible
-                      .secured(guardian)
-                      .where(id: push_tid_setting)
-                      .limit(1)
-                      .pluck(:id, :category_id)
-                      .first
+                  push_scope = Topic.visible.secured(guardian).where(id: push_tid_setting)
+                  push_scope = push_scope.where("topics.created_at > ?", age_cutoff) if age_cutoff
+                  row = push_scope.limit(1).pluck(:id, :category_id).first
 
                   if row
                     tid = row[0].to_i
@@ -1641,7 +1715,7 @@ after_initialize do
                       user,
                       original_relation,
                       limit: limit,
-                      last_digest_sent_at: last_digest_sent_at
+                      last_digest_sent_at: created_after_cutoff
                     )
                   if picked_id.to_i > 0
                     push_selected_topic_id = picked_id.to_i
@@ -1877,7 +1951,7 @@ after_initialize do
       watched_filter_applied = false
 
       created_after_last_digest_filter_enabled = ::PromoDigestSettings.filter_promo_topics_created_after_last_digest?
-      created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && last_digest_sent_at.present?)
+      created_after_last_digest_filter_applied = (created_after_last_digest_filter_enabled && created_after_cutoff.present?)
 
       promo_pick_mode = ::PromoDigestSettings.promo_pick_mode
       prefer_digest_list_mode = (promo_pick_mode == "prefer_digest_list")
@@ -1918,7 +1992,7 @@ after_initialize do
       superpromo_used_fallback_outside_digest = false
 
       superpromo_created_after_enabled = ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest?
-      superpromo_created_after_applied = (superpromo_created_after_enabled && last_digest_sent_at.present?)
+      superpromo_created_after_applied = (superpromo_created_after_enabled && created_after_cutoff.present?)
 
       hardsale_has_tagged_in_top = false
       hardsale_is_skipped_hastag = false
@@ -1942,7 +2016,7 @@ after_initialize do
       hardsale_used_fallback_outside_digest = false
 
       hardsale_created_after_enabled = ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest?
-      hardsale_created_after_applied = (hardsale_created_after_enabled && last_digest_sent_at.present?)
+      hardsale_created_after_applied = (hardsale_created_after_enabled && created_after_cutoff.present?)
 
       # ============================================================
       # Promo injection block (blocked by min-digests gate)
@@ -1970,7 +2044,7 @@ after_initialize do
                   user,
                   tag_ids: tag_ids,
                   digest_ids: original_ids,
-                  created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                  created_after: later_cutoff((created_after_last_digest_filter_applied ? created_after_cutoff : nil), age_cutoff)
                 )
 
               digest_list_candidates_count = cand_ct
@@ -1996,7 +2070,7 @@ after_initialize do
                     tag_ids: tag_ids,
                     exclude_ids: original_ids,
                     limit: remaining_need,
-                    created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                    created_after: later_cutoff((created_after_last_digest_filter_applied ? created_after_cutoff : nil), age_cutoff)
                   )
 
                 used_fallback_outside_digest = fallback_ids.present?
@@ -2032,7 +2106,7 @@ after_initialize do
                   tag_ids: tag_ids,
                   exclude_ids: final_ids,
                   limit: replace_indices.length,
-                  created_after: (created_after_last_digest_filter_applied ? last_digest_sent_at : nil)
+                  created_after: later_cutoff((created_after_last_digest_filter_applied ? created_after_cutoff : nil), age_cutoff)
                 )
 
               if injected_ids.length == replace_indices.length
@@ -2100,7 +2174,7 @@ after_initialize do
                     user,
                     tag_ids: superpromo_tag_ids,
                     digest_ids: final_ids,
-                    created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                    created_after: later_cutoff((superpromo_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                   )
 
                 superpromo_digest_list_candidates_count = cand_ct
@@ -2126,7 +2200,7 @@ after_initialize do
                       tag_ids: superpromo_tag_ids,
                       exclude_ids: tmp_ids,
                       limit: remaining_need,
-                      created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                      created_after: later_cutoff((superpromo_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                     )
 
                   superpromo_used_fallback_outside_digest = fallback_ids.present?
@@ -2163,7 +2237,7 @@ after_initialize do
                       tag_ids: superpromo_tag_ids,
                       exclude_ids: final_ids,
                       limit: superpromo_replace_indices.length,
-                      created_after: (superpromo_created_after_applied ? last_digest_sent_at : nil)
+                      created_after: later_cutoff((superpromo_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                     )
 
                 if superpromo_injected_ids.length == superpromo_replace_indices.length
@@ -2232,7 +2306,7 @@ after_initialize do
                     user,
                     tag_ids: hardsale_tag_ids,
                     digest_ids: final_ids,
-                    created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                    created_after: later_cutoff((hardsale_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                   )
 
                 hardsale_digest_list_candidates_count = cand_ct
@@ -2258,7 +2332,7 @@ after_initialize do
                       tag_ids: hardsale_tag_ids,
                       exclude_ids: tmp_ids,
                       limit: remaining_need,
-                      created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                      created_after: later_cutoff((hardsale_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                     )
 
                   hardsale_used_fallback_outside_digest = fallback_ids.present?
@@ -2295,7 +2369,7 @@ after_initialize do
                       tag_ids: hardsale_tag_ids,
                       exclude_ids: final_ids,
                       limit: hardsale_replace_indices.length,
-                      created_after: (hardsale_created_after_applied ? last_digest_sent_at : nil)
+                      created_after: later_cutoff((hardsale_created_after_applied ? created_after_cutoff : nil), age_cutoff)
                     )
 
                 if hardsale_injected_ids.length == hardsale_replace_indices.length
@@ -2322,7 +2396,7 @@ after_initialize do
             final_ids,
             original_relation,
             limit: limit,
-            last_digest_sent_at: last_digest_sent_at
+            last_digest_sent_at: created_after_cutoff
           )
       rescue => e
         Rails.logger.warn("[#{PLUGIN_NAME}] watched-percent enforcer wrapper failed: #{e.class}: #{e.message}")
@@ -2374,6 +2448,9 @@ after_initialize do
         else
           nil
         end
+
+      # MAX TOPIC AGE safety net: drop anything older that slipped through.
+      final_ids = drop_topics_older_than(final_ids, age_cutoff) if age_cutoff
 
       # ============================================================
       # PERSIST FINAL DIGEST CONTENTS
@@ -2720,7 +2797,7 @@ after_initialize do
       soft_fallback = ::PromoDigestSettings.force_first_topic_soft_fallback?
 
       last_ts = nil
-      last_ts = last_digest_sent_at_for_user(user) if require_created_after
+      last_ts = created_after_cutoff_for_user(user) if require_created_after
 
       top_n = ::PromoDigestSettings.force_first_topic_random_top_n
 
@@ -2788,7 +2865,7 @@ after_initialize do
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.filter_promo_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
@@ -2831,7 +2908,7 @@ after_initialize do
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
@@ -2874,7 +2951,7 @@ after_initialize do
 
       scope = scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
@@ -2965,7 +3042,7 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.filter_promo_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
@@ -3020,7 +3097,7 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.superpromo_filter_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
@@ -3075,7 +3152,7 @@ after_initialize do
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
 
-      if ::PromoDigestSettings.hardsale_filter_topics_created_after_last_digest? && created_after.present?
+      if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
       end
 
