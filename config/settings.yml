@@ -126,6 +126,12 @@ plugins:
     client: false
     type: integer
 
+  promo_digest_injector_blocked_topics_table:
+    default: ""
+    client: false
+    type: string
+    description: "Postgres table with a topic_id column. Promo / superpromo / hardsale / push topics listed there are never injected (e.g. topics whose products are inactive in promo_products). Blank = off."
+
   # =========================
   # SUPERPROMO (independent pipeline)
   # =========================

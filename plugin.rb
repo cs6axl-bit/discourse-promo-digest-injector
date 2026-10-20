@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.14.0
+# version: 1.15.0
 # authors: you
 
 after_initialize do
@@ -1108,6 +1108,36 @@ after_initialize do
     end
 
     # ----------------------------
+    # helper (v1.15.0): drop blocked promo topics from a TopicTag scope.
+    # The table name comes from promo_digest_injector_blocked_topics_table; its existence is checked (cached 5 min)
+    # so a missing table never breaks digest building: the scope is returned unfiltered and a warning is logged.
+    # ----------------------------
+    def self.blocked_topics_table_ready
+      t = SiteSetting.promo_digest_injector_blocked_topics_table.to_s.strip.downcase
+      return nil if t.blank?
+      unless t.match?(/\A[a-z_][a-z0-9_]{0,62}\z/)
+        Rails.logger.warn("[#{PLUGIN_NAME}] blocked_topics_table '#{t}' is not a plain table name; promo filter skipped")
+        return nil
+      end
+      @blocked_tbl_check ||= {}
+      cached = @blocked_tbl_check[t]
+      return (cached[:ok] ? t : nil) if cached && cached[:at] > 5.minutes.ago
+      ok = DB.query_single("SELECT to_regclass(?) IS NOT NULL", t).first == true
+      Rails.logger.warn("[#{PLUGIN_NAME}] blocked_topics_table '#{t}' not found; promo filter skipped") unless ok
+      @blocked_tbl_check[t] = { ok: ok, at: Time.now }
+      ok ? t : nil
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] blocked_topics_table check failed: #{e.class}: #{e.message}")
+      nil
+    end
+
+    def self.exclude_blocked_topics(scope, column = "topic_tags.topic_id")
+      t = blocked_topics_table_ready
+      return scope if t.nil?
+      scope.where("#{column} NOT IN (SELECT topic_id FROM #{t})")
+    end
+
+    # ----------------------------
     # helper: does a topic have ANY of the given tags?
     # ----------------------------
     def self.topic_has_any_tag?(topic_id, tag_ids)
@@ -1424,6 +1454,7 @@ after_initialize do
 
         scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
         scope = scope.where.not(topic_tags: { topic_id: exclude_set.to_a }) if exclude_set.present?
+        scope = ::PromoDigestInjector.exclude_blocked_topics(scope)
 
         cand_ids =
           scope
@@ -1496,6 +1527,7 @@ after_initialize do
 
       scope = scope.where("topics.created_at > ?", created_after) if created_after.present?
 
+      scope = ::PromoDigestInjector.exclude_blocked_topics(scope)
       cand_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
       return [] if cand_ids.blank?
 
@@ -2651,7 +2683,7 @@ after_initialize do
     def self.fetch_tagged_topic_ids_any_tag(topic_ids, tag_ids)
       return [] if topic_ids.blank?
       return [] if tag_ids.blank?
-      TopicTag.where(topic_id: topic_ids, tag_id: tag_ids).distinct.pluck(:topic_id)
+      exclude_blocked_topics(TopicTag.where(topic_id: topic_ids, tag_id: tag_ids)).distinct.pluck(:topic_id)
     end
 
     def self.fetch_tagged_topic_ids_any_tag_in_categories(topic_ids, tag_ids, category_ids)
@@ -2660,12 +2692,12 @@ after_initialize do
       cids = Array(category_ids).map(&:to_i).reject(&:zero?).uniq
       return [] if cids.blank?
 
-      TopicTag
-        .joins(:topic)
-        .where(topic_tags: { topic_id: topic_ids, tag_id: tag_ids })
-        .where(topics: { category_id: cids })
-        .distinct
-        .pluck("topic_tags.topic_id")
+      exclude_blocked_topics(
+        TopicTag
+          .joins(:topic)
+          .where(topic_tags: { topic_id: topic_ids, tag_id: tag_ids })
+          .where(topics: { category_id: cids })
+      ).distinct.pluck("topic_tags.topic_id")
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] fetch_tagged_topic_ids_any_tag_in_categories failed: #{e.class}: #{e.message}")
       []
@@ -2814,8 +2846,9 @@ after_initialize do
       preferred_rows = watched_rows
       if prefer_promo_only_if_first_is_promo && promo_tag_ids.present?
         promo_ids =
-          TopicTag
-            .where(topic_id: watched_rows.map { |tid, _cid, _c| tid }, tag_id: Array(promo_tag_ids).map(&:to_i))
+          ::PromoDigestInjector.exclude_blocked_topics(
+            TopicTag.where(topic_id: watched_rows.map { |tid, _cid, _c| tid }, tag_id: Array(promo_tag_ids).map(&:to_i))
+          )
             .distinct
             .pluck(:topic_id)
             .map(&:to_i)
@@ -2901,6 +2934,7 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
+      scope = ::PromoDigestInjector.exclude_blocked_topics(scope)
       candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
@@ -2944,6 +2978,7 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
+      scope = ::PromoDigestInjector.exclude_blocked_topics(scope)
       candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
@@ -2987,6 +3022,7 @@ after_initialize do
         scope = scope.where("topics.created_at > ?", created_after)
       end
 
+      scope = ::PromoDigestInjector.exclude_blocked_topics(scope)
       candidate_ids = scope.pluck("topic_tags.topic_id").map(&:to_i).uniq
       candidate_pool_count = candidate_ids.length
       return [Set.new, candidate_pool_count, 0, watched_ids, watched_filter_applied] if candidate_ids.blank?
@@ -3073,6 +3109,7 @@ after_initialize do
           .distinct
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+      topic_tag_scope = ::PromoDigestInjector.exclude_blocked_topics(topic_tag_scope)
 
       if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
@@ -3128,6 +3165,7 @@ after_initialize do
           .distinct
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+      topic_tag_scope = ::PromoDigestInjector.exclude_blocked_topics(topic_tag_scope)
 
       if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
@@ -3183,6 +3221,7 @@ after_initialize do
           .distinct
 
       topic_tag_scope = topic_tag_scope.where(topics: { category_id: watched_ids }) if watched_filter_applied
+      topic_tag_scope = ::PromoDigestInjector.exclude_blocked_topics(topic_tag_scope)
 
       if created_after.present?
         topic_tag_scope = topic_tag_scope.where("topics.created_at > ?", created_after)
