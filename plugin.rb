@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.15.0
+# version: 1.16.0
 # authors: you
 
 after_initialize do
@@ -605,6 +605,25 @@ after_initialize do
       v < 0 ? 0 : v
     rescue
       14
+    end
+
+    # v1.16.0 match-tier weight multipliers (percent -> factor). Missing setting = the default.
+    def self.vslcampaign_tier_pct(name, default)
+      key = :"promo_digest_injector_vslcampaign_tier_#{name}_pct"
+      return default / 100.0 unless SiteSetting.respond_to?(key)
+      v = SiteSetting.public_send(key).to_i
+      (v < 0 ? 0 : v) / 100.0
+    rescue
+      default / 100.0
+    end
+
+    def self.vslcampaign_tier_multipliers
+      {
+        1 => vslcampaign_tier_pct("category_gender", 200),
+        2 => 1.0,
+        3 => vslcampaign_tier_pct("gender_only", 70),
+        4 => vslcampaign_tier_pct("other_gender", 40)
+      }
     end
 
     def self.vslcampaign_history_field
@@ -3642,6 +3661,9 @@ after_initialize do
   #   6. prefer a "source" (product) not mailed to this user within
   #      vslcampaign_source_cooldown_days; else fall back to any remaining row.
   #      Pick is random WEIGHTED by the row's `weight` column (NULL = 1, 0 = never; v1.13.0)
+  #      v1.16.0: in the watched pool the weight is also multiplied by the match tier (watched category +
+  #      same gender x2, watched category x1, gender only x0.7, watched category but other gender x0.4;
+  #      site settings vslcampaign_tier_*_pct); logged as match_tier
   #   v1.14.0 extra gates/filters: only/exclude users tables, rest after ANY campaign email
   #      (rest_days_any_campaign), daily cap (max_per_day), per-VSL max_sends budget and
   #      exclude_email_domains_regex; log also stores user_gender, email_domain, weight, pool_size, for_gender
@@ -3691,6 +3713,7 @@ after_initialize do
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS weight NUMERIC(8,3)")
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS pool_size INTEGER")
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS for_gender VARCHAR(100)")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS match_tier SMALLINT") # v1.16.0, NULL = random_all
       @log_table_ensured = true
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign ensure_log_table! failed: #{e.class}: #{e.message}")
@@ -3932,10 +3955,29 @@ after_initialize do
     # (same-id cooldown was already applied when the pool was built).
     # Within that set, pick at random weighted by the row's `weight` (NULL = 1; rows with
     # weight <= 0 never reach here). Without a weight column every row weighs 1 (plain random).
-    def self.choose_candidate(candidates, recent_source_set)
+    # v1.16.0: with tiers: true (the "watched" pool) each weight is multiplied by the row's match tier
+    # (see match_tier / vslcampaign_tier_multipliers). If every multiplied weight is 0 (e.g. only tier-4
+    # rows left and its multiplier is 0) the plain weights are used: a tier never removes the last option.
+    def self.choose_candidate(candidates, recent_source_set, watched: [], gender: "", tiers: false)
       return nil if candidates.blank?
       fresh = candidates.reject { |c| c.source.present? && recent_source_set.include?(c.source.to_s) }
-      weighted_sample(fresh.presence || candidates)
+      pool = fresh.presence || candidates
+      return weighted_sample(pool) unless tiers
+      mult = ::PromoDigestSettings.vslcampaign_tier_multipliers
+      weighted_sample(pool, ->(c) { mult[match_tier(c, watched, gender)] || 1.0 })
+    end
+
+    # 1 = watched category + for_gender = user's gender, 2 = watched category, no/unknown gender match,
+    # 3 = gender only (category not watched), 4 = watched category but aimed at the other gender.
+    # Users whose gender isn't male/female never get tier 1 or 4.
+    def self.match_tier(c, watched, gender)
+      in_cat = Array(watched).map(&:to_i).include?(c.forcategory.to_i)
+      fg = c.respond_to?(:for_gender) ? c.for_gender.to_s.strip.downcase : ""
+      g = gender.to_s.strip.downcase
+      known = %w[male female].include?(g)
+      return 3 unless in_cat
+      return 2 if fg.empty? || !known
+      fg == g ? 1 : 4
     end
 
     def self.candidate_weight(c)
@@ -3943,8 +3985,12 @@ after_initialize do
       w.nil? ? 1.0 : w.to_f
     end
 
-    def self.weighted_sample(pool)
+    def self.weighted_sample(pool, multiplier = nil)
       weights = pool.map { |c| [candidate_weight(c), 0.0].max }
+      if multiplier
+        tiered = pool.each_with_index.map { |c, i| weights[i] * [multiplier.call(c).to_f, 0.0].max }
+        weights = tiered if tiered.sum > 0
+      end
       total = weights.sum
       return pool.sample if total <= 0
       r = rand * total
@@ -4040,10 +4086,11 @@ after_initialize do
     end
 
     def self.record_send!(user:, cand:, campaign_key:, queue_id:, selection_mode:, subjects:, preheaders:,
-                          user_gender: nil, email_domain: nil, pool_size: nil)
+                          user_gender: nil, email_domain: nil, pool_size: nil, match_tier: nil)
       ensure_log_table!
 
       log_params = {
+        tier: match_tier,
         ugender: user_gender.to_s.presence,
         edomain: email_domain.to_s.presence,
         weight: (cand.respond_to?(:weight) ? cand.weight : nil),
@@ -4066,10 +4113,10 @@ after_initialize do
         INSERT INTO #{LOG_TABLE}
           (user_id, vsl_id, source, forcategory, campaign_key, queue_id, selection_mode,
            offer_url, angle_name, subject_lines_json, preheaders_json, created_at,
-           user_gender, email_domain, weight, pool_size, for_gender)
+           user_gender, email_domain, weight, pool_size, for_gender, match_tier)
         VALUES
           (:uid, :vsl_id, :source, :cat, :key, :qid, :mode, :offer, :angle, :subs, :pre, NOW(),
-           :ugender, :edomain, :weight, :pool, :fgender)
+           :ugender, :edomain, :weight, :pool, :fgender, :tier)
       SQL
 
       persist_history!(user, {
@@ -4362,8 +4409,10 @@ after_initialize do
 
       return out.merge(reason: "no_candidates", selection_mode: selection_mode) if candidates.blank?
 
-      cand = choose_candidate(candidates, recent_srcs)
+      tiered = selection_mode == "watched"
+      cand = choose_candidate(candidates, recent_srcs, watched: watched, gender: gender, tiers: tiered)
       return out.merge(reason: "no_candidate_chosen", selection_mode: selection_mode) if cand.nil?
+      tier_used = tiered ? match_tier(cand, watched, gender) : nil
 
       # Record which rule matched: category watch wins; otherwise it came in via for_gender.
       if selection_mode == "watched" && !watched.include?(cand.forcategory.to_i)
@@ -4396,7 +4445,7 @@ after_initialize do
       record_send!(
         user: user, cand: cand, campaign_key: campaign_key, queue_id: enq[:queue_id],
         selection_mode: selection_mode, subjects: subjects, preheaders: preheaders,
-        user_gender: gender, email_domain: domain, pool_size: candidates.length
+        user_gender: gender, email_domain: domain, pool_size: candidates.length, match_tier: tier_used
       )
       bump_sends_today!
 

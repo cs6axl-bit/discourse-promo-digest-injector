@@ -622,6 +622,31 @@ plugins:
     client: false
     type: integer
 
+  # v1.16.0 match tiers: inside the candidate pool, a row's weight is multiplied (percent, 100 = x1) by how well it
+  # fits the user. Tier 1 = watched category AND for_gender = user's gender; tier 2 = watched category, for_gender
+  # empty (always x1); tier 3 = gender only (category not watched); tier 4 = watched category but for_gender = the
+  # other gender. 0 = "only when nothing else is left" (never excluded). All 100 = old behaviour.
+  promo_digest_injector_vslcampaign_tier_category_gender_pct:
+    default: 200
+    min: 0
+    max: 10000
+    client: false
+    type: integer
+
+  promo_digest_injector_vslcampaign_tier_gender_only_pct:
+    default: 70
+    min: 0
+    max: 10000
+    client: false
+    type: integer
+
+  promo_digest_injector_vslcampaign_tier_other_gender_pct:
+    default: 40
+    min: 0
+    max: 10000
+    client: false
+    type: integer
+
   # Per-user JSON history of the last N campaigns sent this way (full details, minus html)
   promo_digest_injector_vslcampaign_history_field:
     default: "promo_digest_vslcampaign_last20"
