@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.12.0
+# version: 1.14.0
 # authors: you
 
 after_initialize do
@@ -677,6 +677,38 @@ after_initialize do
       SiteSetting.promo_digest_injector_vslcampaign_gender_field.to_s.strip
     rescue
       "user_field_1"
+    end
+
+    # v1.14.0
+    def self.vslcampaign_rest_days_any_campaign
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_rest_days_any_campaign)
+      [SiteSetting.promo_digest_injector_vslcampaign_rest_days_any_campaign.to_i, 0].max
+    rescue
+      0
+    end
+
+    def self.vslcampaign_max_per_day
+      return 0 unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_max_per_day)
+      [SiteSetting.promo_digest_injector_vslcampaign_max_per_day.to_i, 0].max
+    rescue
+      0
+    end
+
+    # Table names are validated as plain [schema.]identifier; anything else = "" (setting ignored).
+    def self.vslcampaign_table_setting(name)
+      return "" unless SiteSetting.respond_to?(name)
+      raw = SiteSetting.public_send(name).to_s.strip
+      raw.match?(/\A[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?\z/) ? raw : ""
+    rescue
+      ""
+    end
+
+    def self.vslcampaign_only_users_table
+      vslcampaign_table_setting(:promo_digest_injector_vslcampaign_only_users_table)
+    end
+
+    def self.vslcampaign_exclude_users_table
+      vslcampaign_table_setting(:promo_digest_injector_vslcampaign_exclude_users_table)
     end
   end
 
@@ -3569,7 +3601,11 @@ after_initialize do
   #   5. drop rows already sent to this user within
   #      vslcampaign_same_campaign_cooldown_days
   #   6. prefer a "source" (product) not mailed to this user within
-  #      vslcampaign_source_cooldown_days; else fall back to any remaining row
+  #      vslcampaign_source_cooldown_days; else fall back to any remaining row.
+  #      Pick is random WEIGHTED by the row's `weight` column (NULL = 1, 0 = never; v1.13.0)
+  #   v1.14.0 extra gates/filters: only/exclude users tables, rest after ANY campaign email
+  #      (rest_days_any_campaign), daily cap (max_per_day), per-VSL max_sends budget and
+  #      exclude_email_domains_regex; log also stores user_gender, email_domain, weight, pool_size, for_gender
   #   7. build a DigestCampaigns campaign from html_full + subjects/
   #      preheaders, enqueue the user, suppress the normal digest
   #   8. log it (promo_digest_vslcampaign_log + per-user last-N custom field)
@@ -3608,6 +3644,14 @@ after_initialize do
       DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_created ON #{LOG_TABLE} (user_id, created_at)")
       DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_vsl     ON #{LOG_TABLE} (user_id, vsl_id)")
       DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_user_source  ON #{LOG_TABLE} (user_id, source)")
+      # v1.14.0: daily cap counts by created_at, per-VSL send budgets count by vsl_id, richer per-send log.
+      DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_created      ON #{LOG_TABLE} (created_at)")
+      DB.exec("CREATE INDEX IF NOT EXISTS idx_pdvcl_vsl          ON #{LOG_TABLE} (vsl_id)")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS user_gender VARCHAR(40)")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS email_domain VARCHAR(255)")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS weight NUMERIC(8,3)")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS pool_size INTEGER")
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS for_gender VARCHAR(100)")
       @log_table_ensured = true
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign ensure_log_table! failed: #{e.class}: #{e.message}")
@@ -3692,6 +3736,56 @@ after_initialize do
       false
     end
 
+    # Optional per-VSL control columns on the campaign table (added once per process when missing,
+    # re-checked every FOR_GENDER_CHECK_TTL seconds, same pattern as for_gender_column?):
+    #   weight                       pick weight inside the pool; NULL = 1, 0 = never picked (v1.13.0)
+    #   max_sends                    test budget: once this flow has logged this many sends of the row, it stops
+    #                                being picked (NULL = no budget) (v1.14.0)
+    #   exclude_email_domains_regex  rows are skipped for users whose primary email DOMAIN matches this regex
+    #                                (case-insensitive), e.g. '\.au$|^bigpond\.com$' for a vendor that bans AU (v1.14.0)
+    OPTIONAL_COLUMNS = {
+      "weight" => "NUMERIC(8,3)",
+      "max_sends" => "INTEGER",
+      "exclude_email_domains_regex" => "TEXT"
+    }.freeze
+
+    def self.optional_columns
+      now = Time.now.to_i
+      return @optional_cols if !@optional_cols.nil? && now - @optional_checked_at.to_i < FOR_GENDER_CHECK_TTL
+
+      tbl = ::PromoDigestSettings.vslcampaign_table_name
+      present = lambda do
+        # column names are our own constants, safe to inline (mini_sql array binding support varies)
+        DB.query_single(<<~SQL, t: tbl).map(&:to_s).to_set
+          SELECT column_name FROM information_schema.columns
+          WHERE table_schema = current_schema() AND table_name = :t
+            AND column_name IN (#{OPTIONAL_COLUMNS.keys.map { |c| "'#{c}'" }.join(',')})
+        SQL
+      end
+
+      found = present.call
+      missing = OPTIONAL_COLUMNS.keys - found.to_a
+      if missing.present? && !@optional_add_tried
+        @optional_add_tried = true
+        missing.each do |col|
+          DB.exec("ALTER TABLE #{tbl} ADD COLUMN IF NOT EXISTS #{col} #{OPTIONAL_COLUMNS[col]}")
+        rescue => e
+          Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign could not add #{tbl}.#{col}: #{e.class}: #{e.message}")
+        end
+        found = present.call
+      end
+
+      @optional_checked_at = now
+      @optional_cols = found
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign optional_columns failed: #{e.class}: #{e.message}")
+      Set.new
+    end
+
+    def self.weight_column?
+      optional_columns.include?("weight")
+    end
+
     def self.received_within_days?(user, days)
       d = days.to_i
       return false if d <= 0
@@ -3741,7 +3835,10 @@ after_initialize do
     def self.fetch_candidate_meta(category_ids:, exclude_ids:, scan_cap:, allowed_sources: [], gender: nil, gender_gate: nil)
       tbl = ::PromoDigestSettings.vslcampaign_table_name
       has_gender_col = for_gender_column?
+      opt_cols = optional_columns
+      has_weight_col = opt_cols.include?("weight")
       where = ["COALESCE(isactive, 1) = 1", "COALESCE(html_full, '') <> ''"]
+      where << "COALESCE(weight, 1) > 0" if has_weight_col
       params = { cap: scan_cap.to_i }
 
       # Optional per-send restriction (digest-campaigns override): only these `source` values
@@ -3773,7 +3870,7 @@ after_initialize do
 
       DB.query(<<~SQL, params)
         SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
-               subject_titles_json, preheaders_json#{has_gender_col ? ', for_gender' : ''}
+               subject_titles_json, preheaders_json#{has_gender_col ? ', for_gender' : ''}#{has_weight_col ? ', weight' : ''}#{opt_cols.include?('max_sends') ? ', max_sends' : ''}#{opt_cols.include?('exclude_email_domains_regex') ? ', exclude_email_domains_regex' : ''}
         FROM #{tbl}
         WHERE #{where.join(" AND ")}
         ORDER BY random()
@@ -3794,10 +3891,29 @@ after_initialize do
 
     # Prefer a product/source not mailed recently; else any remaining row
     # (same-id cooldown was already applied when the pool was built).
+    # Within that set, pick at random weighted by the row's `weight` (NULL = 1; rows with
+    # weight <= 0 never reach here). Without a weight column every row weighs 1 (plain random).
     def self.choose_candidate(candidates, recent_source_set)
       return nil if candidates.blank?
       fresh = candidates.reject { |c| c.source.present? && recent_source_set.include?(c.source.to_s) }
-      (fresh.presence || candidates).sample
+      weighted_sample(fresh.presence || candidates)
+    end
+
+    def self.candidate_weight(c)
+      w = c.respond_to?(:weight) ? c.weight : nil
+      w.nil? ? 1.0 : w.to_f
+    end
+
+    def self.weighted_sample(pool)
+      weights = pool.map { |c| [candidate_weight(c), 0.0].max }
+      total = weights.sum
+      return pool.sample if total <= 0
+      r = rand * total
+      pool.each_with_index do |c, i|
+        r -= weights[i]
+        return c if r < 0
+      end
+      pool.last
     end
 
     def self.ensure_campaign!(vsl_id:, html_full:, subjects:, preheaders:)
@@ -3884,10 +4000,16 @@ after_initialize do
       { ok: false, reason: "#{e.class}: #{e.message}" }
     end
 
-    def self.record_send!(user:, cand:, campaign_key:, queue_id:, selection_mode:, subjects:, preheaders:)
+    def self.record_send!(user:, cand:, campaign_key:, queue_id:, selection_mode:, subjects:, preheaders:,
+                          user_gender: nil, email_domain: nil, pool_size: nil)
       ensure_log_table!
 
       log_params = {
+        ugender: user_gender.to_s.presence,
+        edomain: email_domain.to_s.presence,
+        weight: (cand.respond_to?(:weight) ? cand.weight : nil),
+        pool: pool_size,
+        fgender: (cand.respond_to?(:for_gender) ? cand.for_gender.to_s.presence : nil),
         uid: user.id.to_i,
         vsl_id: cand.id.to_i,
         source: cand.source.to_s.presence,
@@ -3904,9 +4026,11 @@ after_initialize do
       DB.exec(<<~SQL, log_params)
         INSERT INTO #{LOG_TABLE}
           (user_id, vsl_id, source, forcategory, campaign_key, queue_id, selection_mode,
-           offer_url, angle_name, subject_lines_json, preheaders_json, created_at)
+           offer_url, angle_name, subject_lines_json, preheaders_json, created_at,
+           user_gender, email_domain, weight, pool_size, for_gender)
         VALUES
-          (:uid, :vsl_id, :source, :cat, :key, :qid, :mode, :offer, :angle, :subs, :pre, NOW())
+          (:uid, :vsl_id, :source, :cat, :key, :qid, :mode, :offer, :angle, :subs, :pre, NOW(),
+           :ugender, :edomain, :weight, :pool, :fgender)
       SQL
 
       persist_history!(user, {
@@ -3949,6 +4073,134 @@ after_initialize do
       Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign persist_history! failed: #{e.class}: #{e.message}")
     end
 
+    # ---- v1.14.0 helpers -------------------------------------------------
+
+    # Any digest-campaigns email (manual campaign, VSL-flow send, ...) actually sent within N days?
+    def self.rested_violation_any_campaign?(user, days)
+      d = days.to_i
+      return false if d <= 0
+      DB.query_single(<<~SQL, uid: user.id.to_i, cutoff: (Time.now.utc - d * 86_400)).present?
+        SELECT 1 FROM #{::DigestCampaigns::QUEUE_TABLE}
+        WHERE user_id = :uid AND status = 'sent' AND sent_at > :cutoff
+        LIMIT 1
+      SQL
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign rested_violation_any_campaign? failed: #{e.class}: #{e.message}")
+      false
+    end
+
+    DAY_COUNT_TTL = 30
+
+    # VSL sends logged since 00:00 UTC. Cached per process for DAY_COUNT_TTL seconds and bumped locally after each
+    # send, so a cap can overshoot by a few sends per process between refreshes.
+    def self.sends_today
+      now = Time.now.utc
+      if @day_count.nil? || @day_count_day != now.to_date || now.to_i - @day_count_at.to_i >= DAY_COUNT_TTL
+        ensure_log_table!
+        @day_count = DB.query_single(
+          "SELECT COUNT(*) FROM #{LOG_TABLE} WHERE created_at >= :start", start: now.beginning_of_day
+        ).first.to_i
+        @day_count_day = now.to_date
+        @day_count_at = now.to_i
+      end
+      @day_count
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign sends_today failed: #{e.class}: #{e.message}")
+      0
+    end
+
+    def self.bump_sends_today!
+      @day_count = @day_count.to_i + 1 unless @day_count.nil?
+    end
+
+    LIST_TABLE_TTL = 600
+
+    # Which column a user-list table offers for matching: "user_id" preferred, else "email"; nil = unusable.
+    def self.list_table_key(table)
+      @list_keys ||= {}
+      hit = @list_keys[table]
+      return hit[:key] if hit && Time.now.to_i - hit[:at] < LIST_TABLE_TTL
+      schema, name = table.include?(".") ? table.split(".", 2) : [nil, table]
+      cols = DB.query_single(<<~SQL, s: schema, t: name).map(&:to_s)
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = :t AND table_schema = COALESCE(:s, current_schema())
+          AND column_name IN ('user_id', 'email')
+      SQL
+      key = cols.include?("user_id") ? "user_id" : (cols.include?("email") ? "email" : nil)
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign list table #{table} has no user_id/email column") if key.nil?
+      @list_keys[table] = { key: key, at: Time.now.to_i }
+      key
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign list_table_key(#{table}) failed: #{e.class}: #{e.message}")
+      nil
+    end
+
+    # true / false, or nil when the table can't be used (caller then ignores the setting).
+    def self.user_in_list_table?(user, table)
+      key = list_table_key(table)
+      return nil if key.nil?
+      if key == "user_id"
+        DB.query_single("SELECT 1 FROM #{table} WHERE user_id = :uid LIMIT 1", uid: user.id.to_i).present?
+      else
+        email = user.email.to_s.strip.downcase
+        return false if email.blank?
+        DB.query_single("SELECT 1 FROM #{table} WHERE lower(email) = :em LIMIT 1", em: email).present?
+      end
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign user_in_list_table?(#{table}) failed: #{e.class}: #{e.message}")
+      nil
+    end
+
+    def self.email_domain(user)
+      user.email.to_s.strip.downcase.split("@", 2)[1].to_s
+    rescue
+      ""
+    end
+
+    BUDGET_TTL = 120
+
+    # All-time sends logged per vsl_id, for rows that have a max_sends budget. Cached BUDGET_TTL seconds.
+    def self.sends_by_vsl(ids)
+      ids = Array(ids).map(&:to_i).reject(&:zero?).uniq
+      return {} if ids.empty?
+      @budget_cache ||= {}
+      now = Time.now.to_i
+      stale = ids.reject { |i| (c = @budget_cache[i]) && now - c[:at] < BUDGET_TTL }
+      if stale.present?
+        ensure_log_table!
+        counts = DB.query("SELECT vsl_id, COUNT(*) AS n FROM #{LOG_TABLE} WHERE vsl_id IN (#{stale.join(',')}) GROUP BY vsl_id")
+          .map { |r| [r.vsl_id.to_i, r.n.to_i] }.to_h
+        stale.each { |i| @budget_cache[i] = { n: counts[i].to_i, at: now } }
+      end
+      ids.map { |i| [i, @budget_cache[i][:n]] }.to_h
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign sends_by_vsl failed: #{e.class}: #{e.message}")
+      {}
+    end
+
+    def self.domain_excluded?(cand, domain)
+      return false unless cand.respond_to?(:exclude_email_domains_regex)
+      rx = cand.exclude_email_domains_regex.to_s.strip
+      return false if rx.empty? || domain.blank?
+      @rx_cache ||= {}
+      re = (@rx_cache[rx] ||= Regexp.new(rx, Regexp::IGNORECASE, timeout: 0.05))
+      re.match?(domain)
+    rescue RegexpError, Regexp::TimeoutError => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign bad exclude_email_domains_regex on vsl #{cand.id}: #{e.message}")
+      false
+    end
+
+    # Drops rows whose domain regex matches this user and rows that used up their max_sends budget.
+    def self.post_filter(candidates, domain)
+      list = Array(candidates).reject { |c| domain_excluded?(c, domain) }
+      budgeted = list.select { |c| c.respond_to?(:max_sends) && !c.max_sends.nil? }
+      if budgeted.present?
+        counts = sends_by_vsl(budgeted.map(&:id))
+        list = list.reject { |c| c.respond_to?(:max_sends) && !c.max_sends.nil? && counts[c.id.to_i].to_i >= c.max_sends.to_i }
+      end
+      list
+    end
+
     # Returns { queued: true, ... } when a campaign was queued (suppress digest),
     # or { queued: false, reason: "..." } to fall through to the normal flow.
     def self.try_run(user:, last_digest_sent_at: nil)
@@ -3975,10 +4227,32 @@ after_initialize do
         return out.merge(reason: "min_emails_not_met", email_count: email_count, required: min_emails)
       end
 
+      # ---- Gate 1b (v1.14.0): audience tables -------------------------
+      only_tbl = ::PromoDigestSettings.vslcampaign_only_users_table
+      if only_tbl.present? && user_in_list_table?(user, only_tbl) == false
+        return out.merge(reason: "not_in_only_users_table", table: only_tbl)
+      end
+      excl_tbl = ::PromoDigestSettings.vslcampaign_exclude_users_table
+      if excl_tbl.present? && user_in_list_table?(user, excl_tbl) == true
+        return out.merge(reason: "in_exclude_users_table", table: excl_tbl)
+      end
+
       # ---- Gate 2: cooldown for THIS flow -----------------------------
       cooldown_days = ov[:direct] == true ? 0 : ::PromoDigestSettings.vslcampaign_cooldown_days
       if cooldown_days > 0 && received_within_days?(user, cooldown_days)
         return out.merge(reason: "flow_cooldown", cooldown_days: cooldown_days)
+      end
+
+      # ---- Gate 2b (v1.14.0): rest after ANY campaign email ------------
+      rest_days = ov[:direct] == true ? 0 : ::PromoDigestSettings.vslcampaign_rest_days_any_campaign
+      if rest_days > 0 && rested_violation_any_campaign?(user, rest_days)
+        return out.merge(reason: "rest_any_campaign", rest_days: rest_days)
+      end
+
+      # ---- Gate 2c (v1.14.0): daily cap for this flow ------------------
+      day_cap = ::PromoDigestSettings.vslcampaign_max_per_day
+      if day_cap > 0 && sends_today >= day_cap
+        return out.merge(reason: "daily_cap_reached", max_per_day: day_cap)
       end
 
       # ---- Gate 3: coinflip percent to skip --------------------------
@@ -3999,21 +4273,23 @@ after_initialize do
       gender         = for_gender_column? ? user_gender(user) : ""
       selection_mode = nil
       candidates     = []
+      domain         = email_domain(user)
 
       # random_all fallbacks ignore categories but still skip campaigns aimed at another gender.
+      # v1.14.0: every pool is post-filtered (per-VSL domain exclusions + max_sends budgets).
       fetch_all = lambda do
-        fetch_candidate_meta(
+        post_filter(fetch_candidate_meta(
           category_ids: nil, gender_gate: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        )
+        ), domain)
       end
 
       if watched.present? || gender.present?
         selection_mode = "watched"
-        candidates = fetch_candidate_meta(
+        candidates = post_filter(fetch_candidate_meta(
           category_ids: watched, gender: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        )
+        ), domain)
 
         if candidates.blank?
           if watched.present?
@@ -4080,8 +4356,10 @@ after_initialize do
 
       record_send!(
         user: user, cand: cand, campaign_key: campaign_key, queue_id: enq[:queue_id],
-        selection_mode: selection_mode, subjects: subjects, preheaders: preheaders
+        selection_mode: selection_mode, subjects: subjects, preheaders: preheaders,
+        user_gender: gender, email_domain: domain, pool_size: candidates.length
       )
+      bump_sends_today!
 
       out.merge(
         queued:          true,

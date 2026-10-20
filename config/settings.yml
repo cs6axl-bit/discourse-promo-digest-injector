@@ -676,3 +676,33 @@ plugins:
     default: "user_field_1"
     client: false
     type: string
+
+  # v1.14.0 — Skip users who got ANY digest-campaigns email (manual campaigns, VSL-flow sends, ...) within N days.
+  # The flow cooldown above only counts this flow's own sends. 0 = off. Regular-digest campaigns with vsl_direct skip it.
+  promo_digest_injector_vslcampaign_rest_days_any_campaign:
+    default: 0
+    min: 0
+    max: 3650
+    client: false
+    type: integer
+
+  # v1.14.0 — Max VSL emails this flow queues per UTC day (all users). 0 = no cap.
+  promo_digest_injector_vslcampaign_max_per_day:
+    default: 0
+    min: 0
+    max: 10000000
+    client: false
+    type: integer
+
+  # v1.14.0 — Only users listed in this table may get a VSL (table with a user_id or email column), e.g. the core list.
+  # Empty = everyone.
+  promo_digest_injector_vslcampaign_only_users_table:
+    default: ""
+    client: false
+    type: string
+
+  # v1.14.0 — Users listed in this table never get a VSL (user_id or email column). Empty = nobody excluded.
+  promo_digest_injector_vslcampaign_exclude_users_table:
+    default: ""
+    client: false
+    type: string
