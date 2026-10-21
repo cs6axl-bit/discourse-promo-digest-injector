@@ -4282,7 +4282,7 @@ after_initialize do
 
     # Set of lowercased offer sources to skip for this user ([] when the table is missing or the setting is off).
     def self.blocked_sources(user)
-      return Set.new unless vslcampaign_skip_owner_offer_history? && user&.id
+      return Set.new unless ::PromoDigestSettings.vslcampaign_skip_owner_offer_history? && user&.id
       now = Time.now.to_i
       if @hist_tbl_checked_at.nil? || now - @hist_tbl_checked_at > FOR_GENDER_CHECK_TTL
         @hist_tbl = DB.query_single("SELECT to_regclass(:t)::text", t: USER_OFFER_HISTORY_TABLE).first.present?
