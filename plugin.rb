@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.18.0
+# version: 1.19.0
 # authors: you
 
 after_initialize do
@@ -711,6 +711,14 @@ after_initialize do
       [SiteSetting.promo_digest_injector_vslcampaign_max_per_day.to_i, 0].max
     rescue
       0
+    end
+
+    # v1.19.0: owner-data interests (categories bought; LogiCall "not interested") shape the VSL category match
+    def self.vslcampaign_use_owner_interests?
+      return true unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_use_owner_interests)
+      SiteSetting.promo_digest_injector_vslcampaign_use_owner_interests
+    rescue
+      true
     end
 
     # v1.18.0: skip VSL rows for offers the user was already a lead / buyer for in the owner's own data
@@ -3755,9 +3763,33 @@ after_initialize do
       levels = ::PromoDigestInjector.notification_levels(
         include_first_post: ::PromoDigestSettings.vslcampaign_include_watching_first_post?
       )
-      CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id).map(&:to_i).uniq
+      watched = CategoryUser.where(user_id: user.id, notification_level: levels).pluck(:category_id).map(&:to_i).uniq
+      merge_owner_interests(user, watched)
     rescue
       []
+    end
+
+    # v1.19.0: interests = watched categories + categories the user BOUGHT in the owner's data, minus LogiCall
+    # "not interested" categories (unless also bought). Table USER_INTEREST_TABLE (built by the supshop repo,
+    # admin/reports/build-offer-history.mjs). Missing table / setting off = watched only (old behaviour).
+    USER_INTEREST_TABLE = "vsl_user_interest"
+
+    def self.merge_owner_interests(user, watched)
+      return watched unless ::PromoDigestSettings.vslcampaign_use_owner_interests? && user&.id
+      now = Time.now.to_i
+      if @interest_tbl_checked_at.nil? || now - @interest_tbl_checked_at > FOR_GENDER_CHECK_TTL
+        @interest_tbl = DB.query_single("SELECT to_regclass(:t)::text", t: USER_INTEREST_TABLE).first.present?
+        @interest_tbl_checked_at = now
+      end
+      return watched unless @interest_tbl
+      row = DB.query("SELECT bought_categories, not_interested_categories FROM #{USER_INTEREST_TABLE} WHERE user_id = :id LIMIT 1", id: user.id).first
+      return watched unless row
+      bought = Array(row.bought_categories).map(&:to_i)
+      not_int = Array(row.not_interested_categories).map(&:to_i) - bought
+      ((watched - not_int) + bought).uniq
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign merge_owner_interests failed: #{e.class}: #{e.message}")
+      watched
     end
 
     # User's gender from user_custom_fields (vslcampaign_gender_field), lowercased; "" if unset.

@@ -726,6 +726,9 @@ plugins:
   promo_digest_injector_vslcampaign_skip_owner_offer_history:
     default: true
     client: false
+  promo_digest_injector_vslcampaign_use_owner_interests:
+    default: true
+    client: false
     type: integer
 
   # v1.14.0 — Only users listed in this table may get a VSL (table with a user_id or email column), e.g. the core list.
