@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.17.0
+# version: 1.18.0
 # authors: you
 
 after_initialize do
@@ -711,6 +711,14 @@ after_initialize do
       [SiteSetting.promo_digest_injector_vslcampaign_max_per_day.to_i, 0].max
     rescue
       0
+    end
+
+    # v1.18.0: skip VSL rows for offers the user was already a lead / buyer for in the owner's own data
+    def self.vslcampaign_skip_owner_offer_history?
+      return true unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_skip_owner_offer_history)
+      SiteSetting.promo_digest_injector_vslcampaign_skip_owner_offer_history
+    rescue
+      true
     end
 
     # Table names are validated as plain [schema.]identifier; anything else = "" (setting ignored).
@@ -4267,6 +4275,26 @@ after_initialize do
       ""
     end
 
+    # v1.18.0 (owner 2026-10-21): offers this user was already a lead / buyer for in the owner's media-buying + LogiCall
+    # data are skipped — except the test group (allow_same_offer: 10% of users, common mailbox domains only), which
+    # still gets them so the effect can be measured. Table built by the supshop repo (admin/reports/build-offer-history.mjs).
+    USER_OFFER_HISTORY_TABLE = "vsl_user_offer_history"
+
+    # Set of lowercased offer sources to skip for this user ([] when the table is missing or the setting is off).
+    def self.blocked_sources(user)
+      return Set.new unless vslcampaign_skip_owner_offer_history? && user&.id
+      now = Time.now.to_i
+      if @hist_tbl_checked_at.nil? || now - @hist_tbl_checked_at > FOR_GENDER_CHECK_TTL
+        @hist_tbl = DB.query_single("SELECT to_regclass(:t)::text", t: USER_OFFER_HISTORY_TABLE).first.present?
+        @hist_tbl_checked_at = now
+      end
+      return Set.new unless @hist_tbl
+      DB.query_single("SELECT lower(source) FROM #{USER_OFFER_HISTORY_TABLE} WHERE user_id = :id AND NOT allow_same_offer", id: user.id).to_set
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign blocked_sources failed: #{e.class}: #{e.message}")
+      Set.new
+    end
+
     # true = this row's offer does not ship to the (known) country. Allow list "US,CA" or deny list "-NZ,-IE".
     def self.country_excluded?(cand, country)
       return false if country.blank? || !cand.respond_to?(:ship_countries)
@@ -4314,8 +4342,10 @@ after_initialize do
     # Drops rows whose domain regex matches this user and rows that used up their max_sends budget.
     # v1.17.0: known country → ship_countries decides (domain regex skipped for rows that have a ship list);
     # unknown country, or a row without a ship list → exclude_email_domains_regex as before.
-    def self.post_filter(candidates, domain, country = "")
+    # v1.18.0: rows whose source is in `blocked` (the user's own past offers, owner data) are dropped first.
+    def self.post_filter(candidates, domain, country = "", blocked = nil)
       list = Array(candidates).reject do |c|
+        next true if blocked.present? && blocked.include?(c.source.to_s.downcase)
         has_ship = c.respond_to?(:ship_countries) && c.ship_countries.to_s.strip.present?
         if country.present? && has_ship
           country_excluded?(c, country)
@@ -4405,6 +4435,7 @@ after_initialize do
       candidates     = []
       domain         = email_domain(user)
       country        = user_country(user)
+      blocked        = blocked_sources(user)
 
       # random_all fallbacks ignore categories but still skip campaigns aimed at another gender.
       # v1.14.0: every pool is post-filtered (per-VSL domain exclusions + max_sends budgets).
@@ -4412,7 +4443,7 @@ after_initialize do
         post_filter(fetch_candidate_meta(
           category_ids: nil, gender_gate: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        ), domain, country)
+        ), domain, country, blocked)
       end
 
       if watched.present? || gender.present?
@@ -4420,7 +4451,7 @@ after_initialize do
         candidates = post_filter(fetch_candidate_meta(
           category_ids: watched, gender: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        ), domain, country)
+        ), domain, country, blocked)
 
         if candidates.blank?
           if watched.present?
