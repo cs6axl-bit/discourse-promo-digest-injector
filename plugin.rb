@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.16.0
+# version: 1.17.0
 # authors: you
 
 after_initialize do
@@ -3805,11 +3805,20 @@ after_initialize do
     #                                being picked (NULL = no budget) (v1.14.0)
     #   exclude_email_domains_regex  rows are skipped for users whose primary email DOMAIN matches this regex
     #                                (case-insensitive), e.g. '\.au$|^bigpond\.com$' for a vendor that bans AU (v1.14.0)
+    #   ship_countries               where the offer ships, ISO-2 codes, comma separated (v1.17.0). Allow list
+    #                                ("US,CA,GB,AU,NZ") or deny list ("-NZ,-IE" = everywhere except). NULL = anywhere.
+    #                                Used when the user's country is KNOWN (USER_COUNTRY_TABLE); then the domain regex
+    #                                is skipped. Unknown country → exclude_email_domains_regex as before.
     OPTIONAL_COLUMNS = {
       "weight" => "NUMERIC(8,3)",
       "max_sends" => "INTEGER",
-      "exclude_email_domains_regex" => "TEXT"
+      "exclude_email_domains_regex" => "TEXT",
+      "ship_countries" => "TEXT"
     }.freeze
+
+    # v1.17.0: forum user → ISO-2 country (by phone, from the owner's media-buying data; built by the supshop repo's
+    # admin/reports/build-mb-tables.mjs). Optional: missing table = every user's country is unknown.
+    USER_COUNTRY_TABLE = "vsl_user_country"
 
     def self.optional_columns
       now = Time.now.to_i
@@ -3932,7 +3941,7 @@ after_initialize do
 
       DB.query(<<~SQL, params)
         SELECT id, source, forcategory, offer_url, angle_name, angle_short_name,
-               subject_titles_json, preheaders_json#{has_gender_col ? ', for_gender' : ''}#{has_weight_col ? ', weight' : ''}#{opt_cols.include?('max_sends') ? ', max_sends' : ''}#{opt_cols.include?('exclude_email_domains_regex') ? ', exclude_email_domains_regex' : ''}
+               subject_titles_json, preheaders_json#{has_gender_col ? ', for_gender' : ''}#{has_weight_col ? ', weight' : ''}#{opt_cols.include?('max_sends') ? ', max_sends' : ''}#{opt_cols.include?('exclude_email_domains_regex') ? ', exclude_email_domains_regex' : ''}#{opt_cols.include?('ship_countries') ? ', ship_countries' : ''}
         FROM #{tbl}
         WHERE #{where.join(" AND ")}
         ORDER BY random()
@@ -4243,6 +4252,32 @@ after_initialize do
       ""
     end
 
+    # v1.17.0: ISO-2 country of the user from USER_COUNTRY_TABLE, or "" (unknown / table missing).
+    # Table existence is re-checked every FOR_GENDER_CHECK_TTL seconds.
+    def self.user_country(user)
+      now = Time.now.to_i
+      if @country_tbl_checked_at.nil? || now - @country_tbl_checked_at > FOR_GENDER_CHECK_TTL
+        @country_tbl = DB.query_single("SELECT to_regclass(:t)::text", t: USER_COUNTRY_TABLE).first.present?
+        @country_tbl_checked_at = now
+      end
+      return "" unless @country_tbl && user&.id
+      DB.query_single("SELECT country_code FROM #{USER_COUNTRY_TABLE} WHERE user_id = :id LIMIT 1", id: user.id).first.to_s.strip.upcase
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign user_country failed: #{e.class}: #{e.message}")
+      ""
+    end
+
+    # true = this row's offer does not ship to the (known) country. Allow list "US,CA" or deny list "-NZ,-IE".
+    def self.country_excluded?(cand, country)
+      return false if country.blank? || !cand.respond_to?(:ship_countries)
+      list = cand.ship_countries.to_s.upcase.split(/[\s,]+/).reject(&:blank?)
+      return false if list.empty?
+      deny = list.select { |c| c.start_with?("-") }.map { |c| c.delete_prefix("-") }
+      allow = list.reject { |c| c.start_with?("-") }
+      return true if deny.include?(country)
+      allow.present? && !allow.include?(country)
+    end
+
     BUDGET_TTL = 120
 
     # All-time sends logged per vsl_id, for rows that have a max_sends budget. Cached BUDGET_TTL seconds.
@@ -4277,8 +4312,17 @@ after_initialize do
     end
 
     # Drops rows whose domain regex matches this user and rows that used up their max_sends budget.
-    def self.post_filter(candidates, domain)
-      list = Array(candidates).reject { |c| domain_excluded?(c, domain) }
+    # v1.17.0: known country → ship_countries decides (domain regex skipped for rows that have a ship list);
+    # unknown country, or a row without a ship list → exclude_email_domains_regex as before.
+    def self.post_filter(candidates, domain, country = "")
+      list = Array(candidates).reject do |c|
+        has_ship = c.respond_to?(:ship_countries) && c.ship_countries.to_s.strip.present?
+        if country.present? && has_ship
+          country_excluded?(c, country)
+        else
+          domain_excluded?(c, domain)
+        end
+      end
       budgeted = list.select { |c| c.respond_to?(:max_sends) && !c.max_sends.nil? }
       if budgeted.present?
         counts = sends_by_vsl(budgeted.map(&:id))
@@ -4360,6 +4404,7 @@ after_initialize do
       selection_mode = nil
       candidates     = []
       domain         = email_domain(user)
+      country        = user_country(user)
 
       # random_all fallbacks ignore categories but still skip campaigns aimed at another gender.
       # v1.14.0: every pool is post-filtered (per-VSL domain exclusions + max_sends budgets).
@@ -4367,7 +4412,7 @@ after_initialize do
         post_filter(fetch_candidate_meta(
           category_ids: nil, gender_gate: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        ), domain)
+        ), domain, country)
       end
 
       if watched.present? || gender.present?
@@ -4375,7 +4420,7 @@ after_initialize do
         candidates = post_filter(fetch_candidate_meta(
           category_ids: watched, gender: gender, exclude_ids: exclude_ids,
           scan_cap: scan_cap, allowed_sources: allowed_sources
-        ), domain)
+        ), domain, country)
 
         if candidates.blank?
           if watched.present?
