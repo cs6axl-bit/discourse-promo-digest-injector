@@ -731,6 +731,17 @@ plugins:
     client: false
     type: integer
 
+  # v1.20.0 — Live shop signals (table signal_targets, built by the supshop repo): offers matching a SIGNAL-group user's
+  # fresh shop interest get their pick weight multiplied (and join the pool even outside watched categories).
+  promo_digest_injector_vslcampaign_signal_boost:
+    default: false
+    client: false
+  promo_digest_injector_vslcampaign_signal_boost_multiplier:
+    default: 5
+    min: 1
+    max: 100
+    client: false
+
   # v1.14.0 — Only users listed in this table may get a VSL (table with a user_id or email column), e.g. the core list.
   # Empty = everyone.
   promo_digest_injector_vslcampaign_only_users_table:
