@@ -741,6 +741,11 @@ plugins:
     min: 1
     max: 100
     client: false
+  # v1.21.0 — Profile matching (table profile_boost, built by the supshop repo): per-user weight multipliers for the
+  # best-matching offers (profile group only; the control group keeps the normal pick).
+  promo_digest_injector_vslcampaign_profile_boost:
+    default: false
+    client: false
 
   # v1.14.0 — Only users listed in this table may get a VSL (table with a user_id or email column), e.g. the core list.
   # Empty = everyone.

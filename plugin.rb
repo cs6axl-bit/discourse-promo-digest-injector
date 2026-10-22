@@ -1,7 +1,7 @@
 # frozen_string_literal: true
 # name: discourse-promo-digest-injector
 # about: Ensures digest includes tag-marked topics near the top (with optional random injection) and posts a run summary to an external endpoint (async, non-blocking). Optionally restricts promo picks to categories the user is "watching". Also (A) requires a minimum number of digests before injecting and (B) stores last 50 FINAL digest topic IDs per user (newest digest first, duplicates allowed). Stores last 10 FINAL position-0 topic IDs per user (newest first, duplicates allowed). If user has NO watched categories, can optionally shuffle the first N digest topics. If first topic is promo, forced-first swapping prefers promo-only candidates (fallback to any watched). Enforce min % of watched-category topics in digest list. DEBUG: adds digest_build_uuid + for_digest_call_index + since/opts/callsite into debug payload. FIX: only inject/log for the REAL digest for_digest call (opts[:top_order]==true + opts[:limit] present), skipping Post.for_mailing_list calls etc. VSL CAMPAIGN MODE: before push + every injection, optionally replace the whole digest with an isactive=1 vsl2html_email_outputs campaign matched to the user's watched categories (forcategory) or, when the campaign's for_gender is set, to the user's gender, gated by min emails received + per-flow cooldown + coinflip, avoiding the same campaign id / same product (source) recently, tracking the last N sends per user in promo_digest_vslcampaign_log + a user custom field.
-# version: 1.20.0
+# version: 1.21.0
 # authors: you
 
 after_initialize do
@@ -726,6 +726,16 @@ after_initialize do
     def self.vslcampaign_signal_boost?
       return false unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_signal_boost)
       SiteSetting.promo_digest_injector_vslcampaign_signal_boost
+    rescue
+      false
+    end
+
+    # v1.21.0: per-user profile matching (supshop repo admin/profile/: interest profile from shop / widi / BG / LogiCall /
+    # forum × offer profile) → table profile_boost (user_id, vsl_ids[], mults[]) for the profile group only (30%, the
+    # rest is the control). Off by default.
+    def self.vslcampaign_profile_boost?
+      return false unless SiteSetting.respond_to?(:promo_digest_injector_vslcampaign_profile_boost)
+      SiteSetting.promo_digest_injector_vslcampaign_profile_boost
     rescue
       false
     end
@@ -3748,6 +3758,7 @@ after_initialize do
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS for_gender VARCHAR(100)")
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS match_tier SMALLINT") # v1.16.0, NULL = random_all
       DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS signal_boost SMALLINT") # v1.20.0: 1 = boosted shop-signal pick
+      DB.exec("ALTER TABLE #{LOG_TABLE} ADD COLUMN IF NOT EXISTS profile_boost SMALLINT") # v1.21.0: 1 = profile-matched pick
       @log_table_ensured = true
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign ensure_log_table! failed: #{e.class}: #{e.message}")
@@ -4026,17 +4037,20 @@ after_initialize do
     # (see match_tier / vslcampaign_tier_multipliers). If every multiplied weight is 0 (e.g. only tier-4
     # rows left and its multiplier is 0) the plain weights are used: a tier never removes the last option.
     # v1.20.0: boost_ids (shop-signal matches, signal group only) multiply those rows' weight by the boost setting.
-    def self.choose_candidate(candidates, recent_source_set, watched: [], gender: "", tiers: false, boost_ids: Set.new)
+    # v1.21.0: profile_mults ({ vsl_id => multiplier }, profile group only) multiply too.
+    def self.choose_candidate(candidates, recent_source_set, watched: [], gender: "", tiers: false, boost_ids: Set.new, profile_mults: {})
       return nil if candidates.blank?
       fresh = candidates.reject { |c| c.source.present? && recent_source_set.include?(c.source.to_s) }
       pool = fresh.presence || candidates
       boosting = boost_ids.present?
-      return weighted_sample(pool) unless tiers || boosting
+      profiling = profile_mults.present?
+      return weighted_sample(pool) unless tiers || boosting || profiling
       mult = tiers ? ::PromoDigestSettings.vslcampaign_tier_multipliers : {}
       boost = boosting ? ::PromoDigestSettings.vslcampaign_signal_boost_multiplier : 1.0
       weighted_sample(pool, lambda do |c|
         t = tiers ? (mult[match_tier(c, watched, gender)] || 1.0) : 1.0
-        t * (boosting && boost_ids.include?(c.id.to_i) ? boost : 1.0)
+        t *= boost if boosting && boost_ids.include?(c.id.to_i)
+        t * (profiling ? (profile_mults[c.id.to_i] || 1.0) : 1.0)
       end)
     end
 
@@ -4159,12 +4173,13 @@ after_initialize do
     end
 
     def self.record_send!(user:, cand:, campaign_key:, queue_id:, selection_mode:, subjects:, preheaders:,
-                          user_gender: nil, email_domain: nil, pool_size: nil, match_tier: nil, signal_boost: nil)
+                          user_gender: nil, email_domain: nil, pool_size: nil, match_tier: nil, signal_boost: nil, profile_boost: nil)
       ensure_log_table!
 
       log_params = {
         tier: match_tier,
         sig: signal_boost,
+        prof: profile_boost,
         ugender: user_gender.to_s.presence,
         edomain: email_domain.to_s.presence,
         weight: (cand.respond_to?(:weight) ? cand.weight : nil),
@@ -4187,10 +4202,10 @@ after_initialize do
         INSERT INTO #{LOG_TABLE}
           (user_id, vsl_id, source, forcategory, campaign_key, queue_id, selection_mode,
            offer_url, angle_name, subject_lines_json, preheaders_json, created_at,
-           user_gender, email_domain, weight, pool_size, for_gender, match_tier, signal_boost)
+           user_gender, email_domain, weight, pool_size, for_gender, match_tier, signal_boost, profile_boost)
         VALUES
           (:uid, :vsl_id, :source, :cat, :key, :qid, :mode, :offer, :angle, :subs, :pre, NOW(),
-           :ugender, :edomain, :weight, :pool, :fgender, :tier, :sig)
+           :ugender, :edomain, :weight, :pool, :fgender, :tier, :sig, :prof)
       SQL
 
       persist_history!(user, {
@@ -4359,6 +4374,27 @@ after_initialize do
     rescue => e
       Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign signal_boost_ids failed: #{e.class}: #{e.message}")
       Set.new
+    end
+
+    # v1.21.0: { vsl_id => multiplier } from profile_boost ({} when off, table missing, or the user is in the control group).
+    PROFILE_BOOST_TABLE = "profile_boost"
+
+    def self.profile_boost_map(user)
+      return {} unless ::PromoDigestSettings.vslcampaign_profile_boost? && user&.id
+      now = Time.now.to_i
+      if @prof_tbl_checked_at.nil? || now - @prof_tbl_checked_at > FOR_GENDER_CHECK_TTL
+        @prof_tbl = DB.query_single("SELECT to_regclass(:t)::text", t: PROFILE_BOOST_TABLE).first.present?
+        @prof_tbl_checked_at = now
+      end
+      return {} unless @prof_tbl
+      row = DB.query("SELECT vsl_ids, mults FROM #{PROFILE_BOOST_TABLE} WHERE user_id = :id", id: user.id).first
+      return {} unless row
+      ids = Array(row.vsl_ids).map(&:to_i)
+      mults = Array(row.mults).map(&:to_f)
+      ids.each_with_index.each_with_object({}) { |(id, i), h| h[id] = [mults[i] || 1.0, 1.0].max if id > 0 }
+    rescue => e
+      Rails.logger.warn("[#{PLUGIN_NAME}] vslcampaign profile_boost_map failed: #{e.class}: #{e.message}")
+      {}
     end
 
     # Set of lowercased offer sources to skip for this user ([] when the table is missing or the setting is off).
@@ -4566,19 +4602,22 @@ after_initialize do
 
       # v1.20.0: shop-signal matches join the pool even outside the watched categories (same filters as random_all).
       boost_ids = signal_boost_ids(user)
-      if boost_ids.present?
+      profile_mults = profile_boost_map(user) # v1.21.0
+      wanted = boost_ids | profile_mults.keys.to_set
+      if wanted.present?
         have = candidates.map { |c| c.id.to_i }.to_set
-        extra = fetch_all.call.select { |c| boost_ids.include?(c.id.to_i) && !have.include?(c.id.to_i) }
+        extra = fetch_all.call.select { |c| wanted.include?(c.id.to_i) && !have.include?(c.id.to_i) }
         candidates += extra
       end
 
       return out.merge(reason: "no_candidates", selection_mode: selection_mode) if candidates.blank?
 
       tiered = selection_mode == "watched"
-      cand = choose_candidate(candidates, recent_srcs, watched: watched, gender: gender, tiers: tiered, boost_ids: boost_ids)
+      cand = choose_candidate(candidates, recent_srcs, watched: watched, gender: gender, tiers: tiered, boost_ids: boost_ids, profile_mults: profile_mults)
       return out.merge(reason: "no_candidate_chosen", selection_mode: selection_mode) if cand.nil?
       tier_used = tiered ? match_tier(cand, watched, gender) : nil
       signal_used = boost_ids.include?(cand.id.to_i) ? 1 : (boost_ids.present? ? 0 : nil)
+      profile_used = profile_mults.key?(cand.id.to_i) ? 1 : (profile_mults.present? ? 0 : nil)
 
       # Record which rule matched: category watch wins; otherwise it came in via for_gender.
       if selection_mode == "watched" && !watched.include?(cand.forcategory.to_i)
@@ -4612,7 +4651,7 @@ after_initialize do
         user: user, cand: cand, campaign_key: campaign_key, queue_id: enq[:queue_id],
         selection_mode: selection_mode, subjects: subjects, preheaders: preheaders,
         user_gender: gender, email_domain: domain, pool_size: candidates.length, match_tier: tier_used,
-        signal_boost: signal_used
+        signal_boost: signal_used, profile_boost: profile_used
       )
       bump_sends_today!
 
